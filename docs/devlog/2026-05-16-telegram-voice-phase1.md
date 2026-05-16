@@ -50,3 +50,13 @@ pm2 logs hermes --lines 100
 ## 2026-05-16 Configuration Update
 
 Configured `OPENAI_API_KEY` in `/home/karthik/.hermes/.env` for the running server. Verified Hermes config loading sees the key without recording the secret value in this devlog.
+
+## 2026-05-16 Phase 1.5 Confirmation Loop
+
+Added Telegram inline-button confirmation for parsed voice notes. Parsed voice payloads are stored in memory for 15 minutes and scoped to Telegram user id plus chat id. The buttons currently support:
+
+- Create Reminder: acknowledges that reminder execution is not enabled yet.
+- Edit: asks for corrected text; the next text message from that user/chat is parsed again and shown with fresh confirmation buttons.
+- Cancel: clears the pending action.
+
+This phase still does not execute reminders, tasks, or calendar events.

@@ -84,6 +84,15 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.platforms.pending_actions import (
+    cleanupExpiredPendingActions,
+    clearPendingAction,
+    getPendingAction,
+    markAwaitingCorrection,
+    popAwaitingCorrection,
+    registerPendingAction,
+    updatePendingActionMessage,
+)
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -102,6 +111,8 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".gif": "image/gif",
 }
 _VOICE_PARSE_TYPES = {"reminder", "note", "task", "unknown"}
+_VOICE_CONFIRM_CALLBACK_PREFIX = "vc"
+_VOICE_PENDING_CLEANUP_INTERVAL_SECONDS = 60
 
 
 def _get_openai_api_key() -> Optional[str]:
@@ -260,6 +271,37 @@ def formatVoiceParseReply(transcript: str, parsed: Dict[str, Any]) -> str:
         f"- Confidence: {confidence}\n\n"
         "Not executing yet — Phase 1 only."
     )
+
+
+def formatVoiceConfirmationReply(transcript: str, parsed: Dict[str, Any]) -> str:
+    """Format the Phase 1.5 Telegram confirmation prompt."""
+    parsed = _normalize_voice_parse(parsed)
+    people = ", ".join(parsed["people"]) if parsed["people"] else "None"
+    places = ", ".join(parsed["places"]) if parsed["places"] else "None"
+    task = parsed["task"] or "None"
+    time_value = parsed["time"] or "None"
+    confidence = f"{parsed['confidence']:.2f}"
+    return (
+        f'Heard: "{transcript}"\n\n'
+        "Parsed:\n"
+        f"- Type: {parsed['type']}\n"
+        f"- Task: {task}\n"
+        f"- Time: {time_value}\n"
+        f"- People: {people}\n"
+        f"- Places: {places}\n"
+        f"- Confidence: {confidence}\n\n"
+        "What should I do?"
+    )
+
+
+def voiceConfirmationKeyboard(action_id: str) -> InlineKeyboardMarkup:
+    """Build the Phase 1.5 voice confirmation inline keyboard."""
+    prefix = _VOICE_CONFIRM_CALLBACK_PREFIX
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Create Reminder", callback_data=f"{prefix}:create:{action_id}")],
+        [InlineKeyboardButton("✏️ Edit", callback_data=f"{prefix}:edit:{action_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"{prefix}:cancel:{action_id}")],
+    ])
 
 
 def check_telegram_requirements() -> bool:
@@ -580,6 +622,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._polling_error_task: Optional[asyncio.Task] = None
+        self._voice_pending_cleanup_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
@@ -1581,6 +1624,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
+            if not self._voice_pending_cleanup_task or self._voice_pending_cleanup_task.done():
+                self._voice_pending_cleanup_task = asyncio.create_task(
+                    self._cleanup_voice_pending_actions_loop()
+                )
 
             # Set up DM topics (Bot API 9.4 — Private Chat Topics)
             # Runs after connection is established so the bot can call createForumTopic.
@@ -1602,8 +1649,24 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
             return False
 
+    async def _cleanup_voice_pending_actions_loop(self) -> None:
+        """Periodically clean expired Phase 1.5 voice confirmation actions."""
+        try:
+            while True:
+                await asyncio.sleep(_VOICE_PENDING_CLEANUP_INTERVAL_SECONDS)
+                removed = cleanupExpiredPendingActions()
+                if removed:
+                    logger.info("[Telegram] Cleaned %d expired voice confirmation action(s)", removed)
+        except asyncio.CancelledError:
+            raise
+
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        if self._voice_pending_cleanup_task and not self._voice_pending_cleanup_task.done():
+            self._voice_pending_cleanup_task.cancel()
+            await asyncio.gather(self._voice_pending_cleanup_task, return_exceptions=True)
+        self._voice_pending_cleanup_task = None
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -2784,6 +2847,83 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Voice confirmation callbacks (vc:choice:action_id) ---
+        if data.startswith(f"{_VOICE_CONFIRM_CALLBACK_PREFIX}:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                await query.answer(text="Invalid voice confirmation data.")
+                return
+
+            choice = parts[1]
+            action_id = parts[2]
+            action = getPendingAction(action_id)
+            if not action:
+                await query.answer(text="This voice confirmation has expired.")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            chat_id = str(query_chat_id or "")
+            if caller_id != action.user_id or chat_id != action.chat_id:
+                await query.answer(text="⛔ This confirmation is not for your account.")
+                logger.info(
+                    "[Telegram] Rejected voice confirmation click id=%s caller=%s chat=%s owner=%s/%s",
+                    action_id,
+                    caller_id,
+                    chat_id,
+                    action.user_id,
+                    action.chat_id,
+                )
+                return
+
+            if choice == "create":
+                clearPendingAction(action_id)
+                await query.answer(text="Phase 2 pending.")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                if query.message:
+                    await query.message.reply_text(
+                        "Reminder execution is not enabled yet (Phase 2 pending)."
+                    )
+                logger.info("[Telegram] Voice confirmation create selected id=%s", action_id)
+                return
+
+            if choice == "cancel":
+                clearPendingAction(action_id)
+                await query.answer(text="Cancelled.")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                if query.message:
+                    await query.message.reply_text("Cancelled.")
+                logger.info("[Telegram] Voice confirmation cancelled id=%s", action_id)
+                return
+
+            if choice == "edit":
+                markAwaitingCorrection(
+                    user_id=action.user_id,
+                    chat_id=action.chat_id,
+                    action_id=action_id,
+                )
+                await query.answer(text="Please send corrected text.")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                if query.message:
+                    await query.message.reply_text("Please send corrected text.")
+                logger.info("[Telegram] Voice confirmation edit requested id=%s", action_id)
+                return
+
+            await query.answer(text="Invalid voice confirmation choice.")
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
@@ -4162,6 +4302,15 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not update.message or not update.message.text:
             return
+
+        correction_action = popAwaitingCorrection(
+            user_id=str(getattr(getattr(update.message, "from_user", None), "id", "")),
+            chat_id=str(getattr(update.message, "chat_id", "")),
+        )
+        if correction_action:
+            await self._handle_voice_correction_text(update.message, correction_action)
+            return
+
         if not self._should_process_message(update.message):
             return
 
@@ -4353,6 +4502,76 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
 
+    async def _reply_with_voice_confirmation(
+        self,
+        msg: Message,
+        *,
+        user_id: str,
+        chat_id: str,
+        transcript: str,
+        parsed: Dict[str, Any],
+        source_message_id: Optional[str] = None,
+        previous_action_id: Optional[str] = None,
+    ) -> None:
+        """Register a pending voice action and send confirmation buttons."""
+        if previous_action_id:
+            clearPendingAction(previous_action_id)
+
+        action = registerPendingAction(
+            user_id=user_id,
+            chat_id=chat_id,
+            source_message_id=source_message_id,
+            payload={
+                "transcript": transcript,
+                "parsed": _normalize_voice_parse(parsed),
+            },
+        )
+        logger.info(
+            "[Telegram] Registered voice confirmation action id=%s user=%s chat=%s",
+            action.action_id,
+            user_id,
+            chat_id,
+        )
+        sent = await msg.reply_text(
+            formatVoiceConfirmationReply(transcript, parsed),
+            reply_markup=voiceConfirmationKeyboard(action.action_id),
+        )
+        confirmation_message_id = getattr(sent, "message_id", None)
+        if confirmation_message_id is not None:
+            updatePendingActionMessage(action.action_id, str(confirmation_message_id))
+
+    async def _handle_voice_correction_text(self, msg: Message, action) -> None:
+        """Parse corrected text and show a fresh Phase 1.5 confirmation prompt."""
+        correction = (msg.text or "").strip()
+        if not correction:
+            await msg.reply_text("Please send corrected text.")
+            return
+
+        logger.info(
+            "[Telegram] Re-parsing voice correction for action id=%s user=%s chat=%s",
+            action.action_id,
+            action.user_id,
+            action.chat_id,
+        )
+        try:
+            parsed = await asyncio.to_thread(parseTranscript, correction)
+            await self._reply_with_voice_confirmation(
+                msg,
+                user_id=action.user_id,
+                chat_id=action.chat_id,
+                transcript=correction,
+                parsed=parsed,
+                source_message_id=str(getattr(msg, "message_id", "")),
+                previous_action_id=action.action_id,
+            )
+        except Exception as exc:
+            logger.exception("[Telegram] Voice correction parse failed")
+            await msg.reply_text(
+                "I had trouble parsing that correction: "
+                f"{exc}\n\n"
+                "Please send corrected text again."
+            )
+
     async def _handle_phase1_voice_message(self, msg: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Phase 1 voice capture: transcribe, parse, reply, and stop there."""
         file_id = getattr(getattr(msg, "voice", None), "file_id", None)
@@ -4372,7 +4591,14 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[Telegram] Phase 1 voice transcription complete (%d chars)", len(transcript))
             parsed = await asyncio.to_thread(parseTranscript, transcript)
             logger.info("[Telegram] Phase 1 voice parse complete: %s", parsed)
-            await msg.reply_text(formatVoiceParseReply(transcript, parsed))
+            await self._reply_with_voice_confirmation(
+                msg,
+                user_id=str(getattr(getattr(msg, "from_user", None), "id", "")),
+                chat_id=str(getattr(msg, "chat_id", "")),
+                transcript=transcript,
+                parsed=parsed,
+                source_message_id=str(getattr(msg, "message_id", "")),
+            )
         except Exception as exc:
             logger.exception("[Telegram] Phase 1 voice capture failed")
             await msg.reply_text(
