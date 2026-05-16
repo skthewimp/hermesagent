@@ -151,15 +151,18 @@ def gmail_setup_instructions() -> str:
     creds = gmail_credentials_path()
     token = gmail_token_path()
     contacts = gmail_contacts_path()
+    port = int(os.getenv("GMAIL_OAUTH_PORT", "8765"))
     return (
         "Gmail is not configured yet.\n\n"
         "Setup:\n"
         "1. In Google Cloud Console, enable the Gmail API.\n"
         "2. Create an OAuth client for a Desktop app.\n"
         f"3. Download the client JSON to `{creds}`.\n"
-        "4. Run:\n"
+        "4. If authenticating from your laptop, open an SSH tunnel first:\n"
+        f"   `ssh -L {port}:localhost:{port} karthik@64.227.150.189`\n"
+        "5. Run on the server:\n"
         f"   `/home/karthik/.hermes/hermes-agent/venv/bin/python -m gateway.platforms.gmail_actions auth`\n"
-        f"5. Optional contacts map for names like Subbu: `{contacts}`\n"
+        f"6. Optional contacts map for names like Subbu: `{contacts}`\n"
         "   Example: {\"Subbu\": \"subbu@example.com\"}\n\n"
         f"Tokens will be stored at `{token}` with owner-only permissions."
     )
@@ -209,8 +212,9 @@ def run_oauth_login() -> None:
     if not creds_path.exists():
         raise RuntimeError(f"Missing Gmail OAuth client JSON: {creds_path}")
 
+    port = int(os.getenv("GMAIL_OAUTH_PORT", "8765"))
     flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
-    creds = flow.run_local_server(port=0, open_browser=False)
+    creds = flow.run_local_server(port=port, open_browser=False)
     token_path = gmail_token_path()
     token_path.parent.mkdir(parents=True, exist_ok=True)
     token_path.write_text(creds.to_json(), encoding="utf-8")
@@ -290,4 +294,3 @@ def _main() -> None:
 
 if __name__ == "__main__":
     _main()
-
