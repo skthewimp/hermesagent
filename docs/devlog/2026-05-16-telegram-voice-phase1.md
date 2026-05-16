@@ -60,3 +60,16 @@ Added Telegram inline-button confirmation for parsed voice notes. Parsed voice p
 - Cancel: clears the pending action.
 
 This phase still does not execute reminders, tasks, or calendar events.
+
+## 2026-05-16 Gmail Drafting Integration
+
+Started outbound Gmail support for the voice operating system direction:
+
+- Added `draft_email` voice intent parsing.
+- Added LLM email drafting with practical, conversational tone.
+- Added Telegram draft approval buttons: Send, Edit, Cancel.
+- Added SQLite persistence in `~/.hermes/email_actions.sqlite3`.
+- Added `/draft_emails` to list recent email actions.
+- Added Gmail OAuth/token helper using the official Gmail API Python client stack.
+
+Voice never sends immediately. Gmail sending only happens after tapping Send, and only after OAuth is configured.

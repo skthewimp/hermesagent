@@ -6241,6 +6241,9 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "draft_emails":
+                return await self._handle_draft_emails_command(event)
+
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
             # /btw is an alias of /background and resolves to the same canonical
@@ -6662,6 +6665,9 @@ class GatewayRunner:
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
+
+        if canonical == "draft_emails":
+            return await self._handle_draft_emails_command(event)
 
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
@@ -10058,6 +10064,26 @@ class GatewayRunner:
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
                 return t("gateway.voice.disabled_short")
+
+    async def _handle_draft_emails_command(self, event: MessageEvent) -> str:
+        """Handle /draft_emails - show recent Gmail draft/send actions."""
+        try:
+            from gateway.platforms.gmail_actions import list_email_actions
+        except Exception as exc:
+            return f"Email action storage is unavailable: {exc}"
+
+        user_id = str(getattr(event.source, "user_id", "") or "")
+        actions = list_email_actions(user_id=user_id or None, limit=10)
+        if not actions:
+            return "No draft emails yet."
+
+        lines = ["Recent draft emails:"]
+        for action in actions:
+            recipients = ", ".join(action.recipients) if action.recipients else "None"
+            lines.append(
+                f"- #{action.id} [{action.status}] To: {recipients} | Subject: {action.subject}"
+            )
+        return "\n".join(lines)
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""

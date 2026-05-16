@@ -93,6 +93,11 @@ from gateway.platforms.pending_actions import (
     registerPendingAction,
     updatePendingActionMessage,
 )
+from gateway.platforms.gmail_actions import (
+    create_email_action,
+    send_email,
+    update_email_action_status,
+)
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -110,7 +115,7 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
-_VOICE_PARSE_TYPES = {"reminder", "note", "task", "unknown"}
+_VOICE_PARSE_TYPES = {"reminder", "note", "task", "draft_email", "unknown"}
 _VOICE_CONFIRM_CALLBACK_PREFIX = "vc"
 _VOICE_PENDING_CLEANUP_INTERVAL_SECONDS = 60
 
@@ -194,6 +199,9 @@ def _normalize_voice_parse(parsed: Any) -> Dict[str, Any]:
         "time": _nullable_string(parsed.get("time")),
         "people": _string_list(parsed.get("people")),
         "places": _string_list(parsed.get("places")),
+        "recipients": _string_list(parsed.get("recipients")),
+        "subject": _nullable_string(parsed.get("subject")) or "",
+        "body_summary": _nullable_string(parsed.get("body_summary")) or "",
         "confidence": confidence,
     }
 
@@ -217,7 +225,8 @@ def parseTranscript(transcript: str) -> Dict[str, Any]:
                     "role": "system",
                     "content": (
                         "Parse the user's transcribed Telegram voice note into JSON only. "
-                        "Classify type as reminder, note, task, or unknown. "
+                        "Classify type as reminder, note, task, draft_email, or unknown. "
+                        "Use draft_email when the user asks to write, draft, or send an email. "
                         "Do not execute anything or invent missing details."
                     ),
                 },
@@ -232,20 +241,103 @@ def parseTranscript(transcript: str) -> Dict[str, Any]:
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "type": {"type": "string", "enum": ["reminder", "note", "task", "unknown"]},
+                            "type": {"type": "string", "enum": ["reminder", "note", "task", "draft_email", "unknown"]},
                             "task": {"type": ["string", "null"]},
                             "time": {"type": ["string", "null"]},
                             "people": {"type": "array", "items": {"type": "string"}},
                             "places": {"type": "array", "items": {"type": "string"}},
+                            "recipients": {"type": "array", "items": {"type": "string"}},
+                            "subject": {"type": "string"},
+                            "body_summary": {"type": "string"},
                             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         },
-                        "required": ["type", "task", "time", "people", "places", "confidence"],
+                        "required": [
+                            "type",
+                            "task",
+                            "time",
+                            "people",
+                            "places",
+                            "recipients",
+                            "subject",
+                            "body_summary",
+                            "confidence",
+                        ],
                     },
                 },
             },
         )
         content = completion.choices[0].message.content or "{}"
         return _normalize_voice_parse(json.loads(content))
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+def draftEmailContent(transcript: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a concise Gmail draft from parsed voice intent."""
+    api_key = _get_openai_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("openai package is not installed") from exc
+
+    parsed = _normalize_voice_parse(parsed)
+    client = OpenAI(api_key=api_key)
+    try:
+        completion = client.chat.completions.create(
+            model=os.getenv("HERMES_TELEGRAM_VOICE_PARSE_MODEL", "gpt-4.1-mini"),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Write a concise human email draft from a voice command. "
+                        "Preserve the spoken intent. Keep the tone practical, conversational, "
+                        "and direct. Avoid corporate fluff. Return JSON only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "transcript": transcript,
+                            "recipients": parsed.get("recipients", []),
+                            "subject_hint": parsed.get("subject", ""),
+                            "body_summary": parsed.get("body_summary", ""),
+                        }
+                    ),
+                },
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "gmail_draft",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "recipients": {"type": "array", "items": {"type": "string"}},
+                            "subject": {"type": "string"},
+                            "body": {"type": "string"},
+                        },
+                        "required": ["recipients", "subject", "body"],
+                    },
+                },
+            },
+        )
+        content = completion.choices[0].message.content or "{}"
+        draft = json.loads(content)
+        recipients = draft.get("recipients")
+        if not isinstance(recipients, list):
+            recipients = parsed.get("recipients", [])
+        return {
+            "recipients": [str(item).strip() for item in recipients if str(item).strip()],
+            "subject": str(draft.get("subject") or parsed.get("subject") or "Quick note").strip(),
+            "body": str(draft.get("body") or parsed.get("body_summary") or transcript).strip(),
+        }
     finally:
         close = getattr(client, "close", None)
         if callable(close):
@@ -301,6 +393,29 @@ def voiceConfirmationKeyboard(action_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Create Reminder", callback_data=f"{prefix}:create:{action_id}")],
         [InlineKeyboardButton("✏️ Edit", callback_data=f"{prefix}:edit:{action_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"{prefix}:cancel:{action_id}")],
+    ])
+
+
+def formatEmailDraftReply(draft: Dict[str, Any]) -> str:
+    recipients = ", ".join(draft.get("recipients") or []) or "None"
+    subject = str(draft.get("subject") or "").strip() or "(no subject)"
+    body = str(draft.get("body") or "").strip()
+    return (
+        "Drafted email:\n\n"
+        f"To: {recipients}\n"
+        f"Subject: {subject}\n\n"
+        f"{body}"
+    )
+
+
+def emailDraftKeyboard(action_id: str) -> InlineKeyboardMarkup:
+    prefix = _VOICE_CONFIRM_CALLBACK_PREFIX
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Send", callback_data=f"{prefix}:send:{action_id}"),
+            InlineKeyboardButton("Edit", callback_data=f"{prefix}:email_edit:{action_id}"),
+            InlineKeyboardButton("Cancel", callback_data=f"{prefix}:email_cancel:{action_id}"),
+        ],
     ])
 
 
@@ -2880,6 +2995,68 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return
 
+            if choice == "send":
+                if action.payload.get("kind") != "draft_email":
+                    await query.answer(text="Invalid email draft.")
+                    return
+                draft = action.payload.get("draft") or {}
+                email_action_id = action.payload.get("email_action_id")
+                try:
+                    await asyncio.to_thread(
+                        send_email,
+                        recipients=list(draft.get("recipients") or []),
+                        subject=str(draft.get("subject") or ""),
+                        body=str(draft.get("body") or ""),
+                    )
+                    if email_action_id is not None:
+                        update_email_action_status(int(email_action_id), "sent")
+                    clearPendingAction(action_id)
+                    await query.answer(text="Email sent.")
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    if query.message:
+                        await query.message.reply_text("Email sent.")
+                    logger.info("[Telegram] Gmail draft sent id=%s email_action_id=%s", action_id, email_action_id)
+                except Exception as exc:
+                    await query.answer(text="Email was not sent.")
+                    if query.message:
+                        await query.message.reply_text(str(exc))
+                    logger.warning("[Telegram] Gmail send failed id=%s: %s", action_id, exc, exc_info=True)
+                return
+
+            if choice == "email_cancel":
+                email_action_id = action.payload.get("email_action_id")
+                if email_action_id is not None:
+                    update_email_action_status(int(email_action_id), "cancelled")
+                clearPendingAction(action_id)
+                await query.answer(text="Cancelled.")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                if query.message:
+                    await query.message.reply_text("Cancelled.")
+                logger.info("[Telegram] Gmail draft cancelled id=%s email_action_id=%s", action_id, email_action_id)
+                return
+
+            if choice == "email_edit":
+                markAwaitingCorrection(
+                    user_id=action.user_id,
+                    chat_id=action.chat_id,
+                    action_id=action_id,
+                )
+                await query.answer(text="Please send corrected text.")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                if query.message:
+                    await query.message.reply_text("Please send corrected text.")
+                logger.info("[Telegram] Gmail draft edit requested id=%s", action_id)
+                return
+
             if choice == "create":
                 clearPendingAction(action_id)
                 await query.answer(text="Phase 2 pending.")
@@ -4540,6 +4717,59 @@ class TelegramAdapter(BasePlatformAdapter):
         if confirmation_message_id is not None:
             updatePendingActionMessage(action.action_id, str(confirmation_message_id))
 
+    async def _reply_with_email_draft(
+        self,
+        msg: Message,
+        *,
+        user_id: str,
+        chat_id: str,
+        transcript: str,
+        parsed: Dict[str, Any],
+        source_message_id: Optional[str] = None,
+        previous_action_id: Optional[str] = None,
+    ) -> None:
+        """Generate, persist, and show a Gmail draft with approval buttons."""
+        if previous_action_id:
+            previous = getPendingAction(previous_action_id)
+            previous_email_id = (previous.payload or {}).get("email_action_id") if previous else None
+            if previous_email_id is not None:
+                update_email_action_status(int(previous_email_id), "cancelled")
+            clearPendingAction(previous_action_id)
+
+        draft = await asyncio.to_thread(draftEmailContent, transcript, parsed)
+        email_action = create_email_action(
+            user_id=user_id,
+            recipients=draft["recipients"],
+            subject=draft["subject"],
+            body=draft["body"],
+        )
+        action = registerPendingAction(
+            user_id=user_id,
+            chat_id=chat_id,
+            source_message_id=source_message_id,
+            payload={
+                "kind": "draft_email",
+                "transcript": transcript,
+                "parsed": _normalize_voice_parse(parsed),
+                "draft": draft,
+                "email_action_id": email_action.id,
+            },
+        )
+        logger.info(
+            "[Telegram] Registered Gmail draft action id=%s email_action_id=%s user=%s chat=%s",
+            action.action_id,
+            email_action.id,
+            user_id,
+            chat_id,
+        )
+        sent = await msg.reply_text(
+            formatEmailDraftReply(draft),
+            reply_markup=emailDraftKeyboard(action.action_id),
+        )
+        confirmation_message_id = getattr(sent, "message_id", None)
+        if confirmation_message_id is not None:
+            updatePendingActionMessage(action.action_id, str(confirmation_message_id))
+
     async def _handle_voice_correction_text(self, msg: Message, action) -> None:
         """Parse corrected text and show a fresh Phase 1.5 confirmation prompt."""
         correction = (msg.text or "").strip()
@@ -4555,15 +4785,26 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         try:
             parsed = await asyncio.to_thread(parseTranscript, correction)
-            await self._reply_with_voice_confirmation(
-                msg,
-                user_id=action.user_id,
-                chat_id=action.chat_id,
-                transcript=correction,
-                parsed=parsed,
-                source_message_id=str(getattr(msg, "message_id", "")),
-                previous_action_id=action.action_id,
-            )
+            if parsed.get("type") == "draft_email" or action.payload.get("kind") == "draft_email":
+                await self._reply_with_email_draft(
+                    msg,
+                    user_id=action.user_id,
+                    chat_id=action.chat_id,
+                    transcript=correction,
+                    parsed=parsed,
+                    source_message_id=str(getattr(msg, "message_id", "")),
+                    previous_action_id=action.action_id,
+                )
+            else:
+                await self._reply_with_voice_confirmation(
+                    msg,
+                    user_id=action.user_id,
+                    chat_id=action.chat_id,
+                    transcript=correction,
+                    parsed=parsed,
+                    source_message_id=str(getattr(msg, "message_id", "")),
+                    previous_action_id=action.action_id,
+                )
         except Exception as exc:
             logger.exception("[Telegram] Voice correction parse failed")
             await msg.reply_text(
@@ -4591,14 +4832,26 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[Telegram] Phase 1 voice transcription complete (%d chars)", len(transcript))
             parsed = await asyncio.to_thread(parseTranscript, transcript)
             logger.info("[Telegram] Phase 1 voice parse complete: %s", parsed)
-            await self._reply_with_voice_confirmation(
-                msg,
-                user_id=str(getattr(getattr(msg, "from_user", None), "id", "")),
-                chat_id=str(getattr(msg, "chat_id", "")),
-                transcript=transcript,
-                parsed=parsed,
-                source_message_id=str(getattr(msg, "message_id", "")),
-            )
+            user_id = str(getattr(getattr(msg, "from_user", None), "id", ""))
+            chat_id = str(getattr(msg, "chat_id", ""))
+            if parsed.get("type") == "draft_email":
+                await self._reply_with_email_draft(
+                    msg,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    transcript=transcript,
+                    parsed=parsed,
+                    source_message_id=str(getattr(msg, "message_id", "")),
+                )
+            else:
+                await self._reply_with_voice_confirmation(
+                    msg,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    transcript=transcript,
+                    parsed=parsed,
+                    source_message_id=str(getattr(msg, "message_id", "")),
+                )
         except Exception as exc:
             logger.exception("[Telegram] Phase 1 voice capture failed")
             await msg.reply_text(
