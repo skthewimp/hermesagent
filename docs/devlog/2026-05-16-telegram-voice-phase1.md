@@ -46,3 +46,7 @@ Restart Hermes after setting `OPENAI_API_KEY`:
 pm2 restart hermes --update-env
 pm2 logs hermes --lines 100
 ```
+
+## 2026-05-16 Configuration Update
+
+Configured `OPENAI_API_KEY` in `/home/karthik/.hermes/.env` for the running server. Verified Hermes config loading sees the key without recording the secret value in this devlog.
