@@ -135,6 +135,31 @@ class TestGetConnectedPlatforms:
         assert Platform.DINGTALK not in config.get_connected_platforms()
 
 
+class TestEnvOverrides:
+    def test_telegram_home_channel_accepts_numeric_chat_id(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "7215045545")
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="tok")}
+        )
+
+        _apply_env_overrides(config)
+
+        home = config.get_home_channel(Platform.TELEGRAM)
+        assert home is not None
+        assert home.chat_id == "7215045545"
+
+    def test_telegram_home_channel_rejects_username(self, monkeypatch, caplog):
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "KarthikActionBot")
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="tok")}
+        )
+
+        _apply_env_overrides(config)
+
+        assert config.get_home_channel(Platform.TELEGRAM) is None
+        assert "numeric chat id" in caplog.text
+
+
 class TestSessionResetPolicy:
     def test_roundtrip(self):
         policy = SessionResetPolicy(mode="idle", at_hour=6, idle_minutes=120)

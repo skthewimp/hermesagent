@@ -56,6 +56,16 @@ def _coerce_int(value: Any, default: int) -> int:
         return default
 
 
+def _is_telegram_numeric_chat_id(value: Any) -> bool:
+    """Return True when *value* is a Telegram chat id this adapter can send to."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text.startswith("-"):
+        text = text[1:]
+    return text.isdigit()
+
+
 def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> str:
     """Normalize unauthorized DM behavior to a supported value."""
     if isinstance(value, str):
@@ -1264,12 +1274,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     telegram_home = os.getenv("TELEGRAM_HOME_CHANNEL")
     if telegram_home and Platform.TELEGRAM in config.platforms:
-        config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
-            platform=Platform.TELEGRAM,
-            chat_id=telegram_home,
-            name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
-            thread_id=os.getenv("TELEGRAM_HOME_CHANNEL_THREAD_ID") or None,
-        )
+        if _is_telegram_numeric_chat_id(telegram_home):
+            config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+                platform=Platform.TELEGRAM,
+                chat_id=telegram_home.strip(),
+                name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
+                thread_id=os.getenv("TELEGRAM_HOME_CHANNEL_THREAD_ID") or None,
+            )
+        else:
+            logger.warning(
+                "Ignoring TELEGRAM_HOME_CHANNEL=%r: Telegram cron delivery "
+                "requires the numeric chat id, not a bot/user username. "
+                "Send /sethome in Telegram or set TELEGRAM_HOME_CHANNEL to "
+                "your numeric chat id.",
+                telegram_home,
+            )
     
     # Discord
     discord_token = os.getenv("DISCORD_BOT_TOKEN")

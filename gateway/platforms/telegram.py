@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import tempfile
+import uuid
 import html as _html
 import re
 from typing import Dict, List, Optional, Any
@@ -100,6 +101,165 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+_VOICE_PARSE_TYPES = {"reminder", "note", "task", "unknown"}
+
+
+def _get_openai_api_key() -> Optional[str]:
+    """Read OPENAI_API_KEY through Hermes config/env loading."""
+    try:
+        from hermes_cli.config import get_env_value
+        value = get_env_value("OPENAI_API_KEY")
+    except Exception:
+        value = None
+    return (value or os.getenv("OPENAI_API_KEY") or "").strip() or None
+
+
+async def downloadTelegramVoice(ctx: Any, fileId: str) -> str:
+    """Download a Telegram voice file to /tmp and return the local .ogg path."""
+    if not fileId:
+        raise ValueError("Telegram voice file_id is missing")
+    tmp_path = os.path.join(tempfile.gettempdir(), f"hermes_telegram_voice_{uuid.uuid4().hex}.ogg")
+    file_obj = await ctx.bot.get_file(fileId)
+    logger.info("[Telegram] Downloading voice file_id=%s link=%s to %s", fileId, getattr(file_obj, "file_path", ""), tmp_path)
+    await file_obj.download_to_drive(custom_path=tmp_path)
+    return tmp_path
+
+
+def transcribeAudio(filePath: str) -> str:
+    """Transcribe audio with OpenAI's Phase 1 transcription model."""
+    api_key = _get_openai_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("openai package is not installed") from exc
+
+    client = OpenAI(api_key=api_key)
+    try:
+        with open(filePath, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=audio_file,
+                response_format="json",
+            )
+        transcript = getattr(transcription, "text", None)
+        if transcript is None and isinstance(transcription, dict):
+            transcript = transcription.get("text")
+        return str(transcript or "").strip()
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+def _normalize_voice_parse(parsed: Any) -> Dict[str, Any]:
+    if not isinstance(parsed, dict):
+        parsed = {}
+    parsed_type = str(parsed.get("type") or "unknown").strip().lower()
+    if parsed_type not in _VOICE_PARSE_TYPES:
+        parsed_type = "unknown"
+
+    def _nullable_string(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    def _string_list(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    try:
+        confidence = float(parsed.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    return {
+        "type": parsed_type,
+        "task": _nullable_string(parsed.get("task")),
+        "time": _nullable_string(parsed.get("time")),
+        "people": _string_list(parsed.get("people")),
+        "places": _string_list(parsed.get("places")),
+        "confidence": confidence,
+    }
+
+
+def parseTranscript(transcript: str) -> Dict[str, Any]:
+    """Parse a transcript into Phase 1 structured intent JSON."""
+    api_key = _get_openai_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("openai package is not installed") from exc
+
+    client = OpenAI(api_key=api_key)
+    try:
+        completion = client.chat.completions.create(
+            model=os.getenv("HERMES_TELEGRAM_VOICE_PARSE_MODEL", "gpt-4.1-mini"),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Parse the user's transcribed Telegram voice note into JSON only. "
+                        "Classify type as reminder, note, task, or unknown. "
+                        "Do not execute anything or invent missing details."
+                    ),
+                },
+                {"role": "user", "content": transcript},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "telegram_voice_intent",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "type": {"type": "string", "enum": ["reminder", "note", "task", "unknown"]},
+                            "task": {"type": ["string", "null"]},
+                            "time": {"type": ["string", "null"]},
+                            "people": {"type": "array", "items": {"type": "string"}},
+                            "places": {"type": "array", "items": {"type": "string"}},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        },
+                        "required": ["type", "task", "time", "people", "places", "confidence"],
+                    },
+                },
+            },
+        )
+        content = completion.choices[0].message.content or "{}"
+        return _normalize_voice_parse(json.loads(content))
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+def formatVoiceParseReply(transcript: str, parsed: Dict[str, Any]) -> str:
+    """Format the Phase 1 Telegram reply."""
+    parsed = _normalize_voice_parse(parsed)
+    people = ", ".join(parsed["people"]) if parsed["people"] else "None"
+    places = ", ".join(parsed["places"]) if parsed["places"] else "None"
+    task = parsed["task"] or "None"
+    time_value = parsed["time"] or "None"
+    confidence = f"{parsed['confidence']:.2f}"
+    return (
+        f'Heard: "{transcript}"\n\n'
+        "Parsed:\n"
+        f"- Type: {parsed['type']}\n"
+        f"- Task: {task}\n"
+        f"- Time: {time_value}\n"
+        f"- People: {people}\n"
+        f"- Places: {places}\n"
+        f"- Confidence: {confidence}\n\n"
+        "Not executing yet — Phase 1 only."
+    )
 
 
 def check_telegram_requirements() -> bool:
@@ -4193,6 +4353,41 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
 
+    async def _handle_phase1_voice_message(self, msg: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Phase 1 voice capture: transcribe, parse, reply, and stop there."""
+        file_id = getattr(getattr(msg, "voice", None), "file_id", None)
+        tmp_path: Optional[str] = None
+        try:
+            logger.info("[Telegram] Phase 1 voice capture received file_id=%s", file_id)
+            if not _get_openai_api_key():
+                await msg.reply_text(
+                    "I received your voice note, but OPENAI_API_KEY is not configured.\n\n"
+                    "Not executing yet — Phase 1 only."
+                )
+                logger.warning("[Telegram] Phase 1 voice capture skipped: OPENAI_API_KEY missing")
+                return
+
+            tmp_path = await downloadTelegramVoice(context, file_id)
+            transcript = await asyncio.to_thread(transcribeAudio, tmp_path)
+            logger.info("[Telegram] Phase 1 voice transcription complete (%d chars)", len(transcript))
+            parsed = await asyncio.to_thread(parseTranscript, transcript)
+            logger.info("[Telegram] Phase 1 voice parse complete: %s", parsed)
+            await msg.reply_text(formatVoiceParseReply(transcript, parsed))
+        except Exception as exc:
+            logger.exception("[Telegram] Phase 1 voice capture failed")
+            await msg.reply_text(
+                "I received your voice note, but Phase 1 voice capture failed: "
+                f"{exc}\n\n"
+                "Not executing yet — Phase 1 only."
+            )
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                    logger.debug("[Telegram] Removed Phase 1 temp voice file %s", tmp_path)
+                except OSError:
+                    logger.debug("[Telegram] Failed to remove Phase 1 temp voice file %s", tmp_path, exc_info=True)
+
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
@@ -4201,6 +4396,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         
         msg = update.message
+
+        if msg.voice:
+            await self._handle_phase1_voice_message(msg, context)
+            return
         
         # Determine media type
         if msg.sticker:
