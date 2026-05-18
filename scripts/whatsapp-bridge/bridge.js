@@ -23,7 +23,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, renameSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -45,6 +45,8 @@ const WHATSAPP_DEBUG =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const CONTACT_CACHE_FILE = process.env.WHATSAPP_CONTACT_CACHE_FILE ||
+  path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'contacts_cache.json');
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
@@ -55,6 +57,12 @@ const WHATSAPP_TOOL_ONLY =
   process.env &&
   typeof process.env.WHATSAPP_TOOL_ONLY === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_TOOL_ONLY.toLowerCase());
+const WHATSAPP_SYNC_CONTACTS =
+  !process.env.WHATSAPP_SYNC_CONTACTS ||
+  ['1', 'true', 'yes', 'on'].includes(String(process.env.WHATSAPP_SYNC_CONTACTS).toLowerCase());
+const WHATSAPP_CONTACT_CACHE =
+  !process.env.WHATSAPP_CONTACT_CACHE ||
+  ['1', 'true', 'yes', 'on'].includes(String(process.env.WHATSAPP_CONTACT_CACHE).toLowerCase());
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const MAX_OBSERVED_MESSAGES = parseInt(process.env.WHATSAPP_OBSERVED_MESSAGES || '500', 10);
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
@@ -178,7 +186,7 @@ function rememberLidPhoneMapping(first, second) {
   return stored;
 }
 
-function rememberContact(raw) {
+function rememberContact(raw, { persist = true } = {}) {
   if (!raw || typeof raw !== 'object') return;
   const id = normalizeWhatsAppId(raw.id || raw.jid || raw.chatId || raw.phoneNumber || raw.lid);
   const lid = normalizeWhatsAppId(raw.lid);
@@ -199,6 +207,7 @@ function rememberContact(raw) {
   }
 
   rememberLidPhoneMapping(lid, phoneNumber);
+  if (persist) scheduleContactCacheSave();
 }
 
 function rememberMessageContact({ chatId, senderId, senderName, chatName, isGroup }) {
@@ -221,6 +230,55 @@ function contactRows() {
       lid: contact.lid || undefined,
       phoneNumber: contact.phoneNumber || undefined,
     }));
+}
+
+function loadContactCache() {
+  if (!WHATSAPP_CONTACT_CACHE || !existsSync(CONTACT_CACHE_FILE)) return 0;
+  try {
+    const parsed = JSON.parse(readFileSync(CONTACT_CACHE_FILE, 'utf-8'));
+    const rows = Array.isArray(parsed) ? parsed : parsed?.contacts;
+    if (!Array.isArray(rows)) return 0;
+    let loaded = 0;
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue;
+      rememberContact(row, { persist: false });
+      loaded += 1;
+    }
+    return loaded;
+  } catch (error) {
+    if (WHATSAPP_DEBUG) {
+      console.warn('WhatsApp contact cache load failed:', error?.message || error);
+    }
+    return 0;
+  }
+}
+
+function writeContactCache() {
+  if (!WHATSAPP_CONTACT_CACHE) return;
+  const contacts = contactRows().map((contact) => ({
+    id: contact.id,
+    name: contact.name,
+    notify: contact.notify,
+    verifiedName: contact.verifiedName,
+    lid: contact.lid,
+    phoneNumber: contact.phoneNumber,
+  }));
+  if (contacts.length === 0) return;
+  const payload = JSON.stringify({
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    contacts,
+  });
+  try {
+    mkdirSync(path.dirname(CONTACT_CACHE_FILE), { recursive: true });
+    const tmpPath = `${CONTACT_CACHE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmpPath, payload, 'utf-8');
+    renameSync(tmpPath, CONTACT_CACHE_FILE);
+  } catch (error) {
+    if (WHATSAPP_DEBUG) {
+      console.warn('WhatsApp contact cache save failed:', error?.message || error);
+    }
+  }
 }
 
 function resolveContact(query, limit = 10) {
@@ -301,12 +359,38 @@ function buildLidMap() {
 let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
+const APP_STATE_COLLECTIONS = [
+  'critical_block',
+  'critical_unblock_low',
+  'regular_high',
+  'regular_low',
+  'regular',
+];
 
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
 const observedMessages = [];
 const contactsById = new Map();
+let contactSyncPromise = null;
+let contactCacheSaveTimer = null;
+const contactSyncStatus = {
+  enabled: WHATSAPP_SYNC_CONTACTS,
+  runs: 0,
+  inFlight: false,
+  lastStartedAt: null,
+  lastFinishedAt: null,
+  lastError: null,
+};
+
+function scheduleContactCacheSave() {
+  if (!WHATSAPP_CONTACT_CACHE) return;
+  if (contactCacheSaveTimer) clearTimeout(contactCacheSaveTimer);
+  contactCacheSaveTimer = setTimeout(() => {
+    contactCacheSaveTimer = null;
+    writeContactCache();
+  }, 2000);
+}
 
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
@@ -314,6 +398,62 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+
+async function syncContactsFromAppState(reason = 'manual') {
+  if (!WHATSAPP_SYNC_CONTACTS) {
+    return { success: false, skipped: true, reason: 'disabled', contactCount: contactRows().length };
+  }
+  if (!sock?.resyncAppState) {
+    return { success: false, skipped: true, reason: 'socket_not_ready', contactCount: contactRows().length };
+  }
+  if (contactSyncPromise) {
+    try {
+      await contactSyncPromise;
+      return { success: true, reused: true, contactCount: contactRows().length, status: contactSyncStatus };
+    } catch (error) {
+      return {
+        success: false,
+        reused: true,
+        reason,
+        error: error?.message || String(error),
+        contactCount: contactRows().length,
+        status: contactSyncStatus,
+      };
+    }
+  }
+
+  contactSyncStatus.runs += 1;
+  contactSyncStatus.inFlight = true;
+  contactSyncStatus.lastStartedAt = new Date().toISOString();
+  contactSyncStatus.lastFinishedAt = null;
+  contactSyncStatus.lastError = null;
+
+  contactSyncPromise = sock.resyncAppState(APP_STATE_COLLECTIONS, true)
+    .then(() => {
+      contactSyncStatus.lastFinishedAt = new Date().toISOString();
+      return { success: true, contactCount: contactRows().length, status: contactSyncStatus };
+    })
+    .catch((error) => {
+      contactSyncStatus.lastError = error?.message || String(error);
+      throw error;
+    })
+    .finally(() => {
+      contactSyncStatus.inFlight = false;
+      contactSyncPromise = null;
+    });
+
+  try {
+    return await contactSyncPromise;
+  } catch (error) {
+    return {
+      success: false,
+      reason,
+      error: error?.message || String(error),
+      contactCount: contactRows().length,
+      status: contactSyncStatus,
+    };
+  }
+}
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -391,6 +531,13 @@ async function startSocket() {
     } else if (connection === 'open') {
       connectionState = 'connected';
       console.log('✅ WhatsApp connected!');
+      setTimeout(() => {
+        syncContactsFromAppState('connection_open').catch((error) => {
+          if (WHATSAPP_DEBUG) {
+            console.warn('WhatsApp contact sync failed:', error?.message || error);
+          }
+        });
+      }, 1000);
       if (PAIR_ONLY) {
         console.log('✅ Pairing complete. Credentials saved.');
         // Give Baileys a moment to flush creds, then exit cleanly
@@ -730,6 +877,20 @@ app.get('/resolve-contact', (req, res) => {
   return res.status(404).json({ error: 'contact_not_found', matches: [] });
 });
 
+app.get('/contact-sync', (req, res) => {
+  res.json({
+    ...contactSyncStatus,
+    cacheEnabled: WHATSAPP_CONTACT_CACHE,
+    cacheFile: CONTACT_CACHE_FILE,
+    contactCount: contactRows().length,
+  });
+});
+
+app.post('/sync-contacts', async (req, res) => {
+  const result = await syncContactsFromAppState('http');
+  res.status(result.success ? 200 : 503).json(result);
+});
+
 // Send a message
 app.post('/send', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
@@ -945,6 +1106,7 @@ app.get('/health', (req, res) => {
 });
 
 // Start
+const loadedContactCount = loadContactCache();
 if (PAIR_ONLY) {
   // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
   console.log('📱 WhatsApp pairing mode');
@@ -966,6 +1128,9 @@ if (PAIR_ONLY) {
     }
     if (WHATSAPP_TOOL_ONLY) {
       console.log(`🧰 Tool-only mode — observed WhatsApp messages stay in memory and are not sent to Hermes as chat input.`);
+    }
+    if (WHATSAPP_CONTACT_CACHE) {
+      console.log(`👥 Loaded ${loadedContactCount} cached WhatsApp contacts.`);
     }
     console.log();
     startSocket();
