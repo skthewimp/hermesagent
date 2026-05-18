@@ -8,7 +8,9 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 
 import json
 import logging
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
@@ -17,6 +19,7 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
+WHATSAPP_CONTACTS_PATH = get_hermes_home() / "whatsapp_contacts.json"
 
 
 def _normalize_channel_query(value: str) -> str:
@@ -53,6 +56,76 @@ def _session_entry_name(origin: Dict[str, Any]) -> str:
     return f"{base_name} / {topic_label}"
 
 
+def _whatsapp_contacts_path() -> Path:
+    return Path(os.getenv("WHATSAPP_CONTACTS_FILE") or WHATSAPP_CONTACTS_PATH)
+
+
+def _normalize_whatsapp_target(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "@" in text:
+        return text
+    digits = text.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    if digits.startswith("+"):
+        digits = digits[1:]
+    if digits.isdigit():
+        return f"{digits}@s.whatsapp.net"
+    return text
+
+
+def _build_whatsapp_contacts() -> List[Dict[str, str]]:
+    """Build WhatsApp DM targets from a simple name -> phone/JID contacts file."""
+    path = _whatsapp_contacts_path()
+    if not path.exists():
+        return []
+
+    entries: List[Dict[str, str]] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            items = data.items()
+        elif isinstance(data, list):
+            items = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                target = item.get("id") or item.get("chat_id") or item.get("phone") or item.get("jid")
+                if name and target:
+                    items.append((name, target))
+        else:
+            items = []
+
+        seen_ids = set()
+        for name, raw_target in items:
+            target = raw_target
+            if isinstance(raw_target, dict):
+                target = raw_target.get("id") or raw_target.get("chat_id") or raw_target.get("phone") or raw_target.get("jid")
+            entry_id = _normalize_whatsapp_target(target)
+            label = str(name or "").strip()
+            if not label or not entry_id or entry_id in seen_ids:
+                continue
+            seen_ids.add(entry_id)
+            entries.append({"id": entry_id, "name": label, "type": "contact"})
+    except Exception as e:
+        logger.debug("Channel directory: failed to read WhatsApp contacts from %s: %s", path, e)
+
+    return entries
+
+
+def _build_whatsapp() -> List[Dict[str, str]]:
+    entries = _build_whatsapp_contacts()
+    seen_ids = {entry["id"] for entry in entries}
+    for entry in _build_from_sessions("whatsapp"):
+        if entry.get("id") not in seen_ids:
+            entries.append(entry)
+            seen_ids.add(entry.get("id"))
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # Build / refresh
 # ---------------------------------------------------------------------------
@@ -84,7 +157,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         plat_name = plat.value
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
             continue
-        platforms[plat_name] = _build_from_sessions(plat_name)
+        platforms[plat_name] = _build_whatsapp() if plat_name == "whatsapp" else _build_from_sessions(plat_name)
 
     # Include plugin-registered platforms (dynamic enum members aren't in
     # Platform.__members__, so the loop above misses them).

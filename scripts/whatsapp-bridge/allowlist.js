@@ -1,5 +1,5 @@
 import path from 'path';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 
 export function normalizeWhatsAppIdentifier(value) {
   return String(value || '')
@@ -85,4 +85,35 @@ export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
   }
 
   return false;
+}
+
+function isNumericIdentifier(value) {
+  return /^\d+$/.test(value);
+}
+
+export function storeWhatsAppIdentifierMapping(lid, phone, sessionDir) {
+  const normalizedLid = normalizeWhatsAppIdentifier(lid);
+  const normalizedPhone = normalizeWhatsAppIdentifier(phone);
+
+  if (!isNumericIdentifier(normalizedLid) || !isNumericIdentifier(normalizedPhone)) {
+    return false;
+  }
+  if (normalizedLid === normalizedPhone) {
+    return false;
+  }
+
+  try {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      path.join(sessionDir, `lid-mapping-${normalizedPhone}.json`),
+      JSON.stringify(normalizedLid),
+    );
+    writeFileSync(
+      path.join(sessionDir, `lid-mapping-${normalizedLid}_reverse.json`),
+      JSON.stringify(normalizedPhone),
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }

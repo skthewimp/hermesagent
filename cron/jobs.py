@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Union
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +192,7 @@ def _parse_natural_once_schedule(schedule: str) -> Optional[Dict[str, Any]]:
     match = re.match(
         r"^\s*(?:at\s+)?"
         r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?"
-        r"(?:\s+(?P<tz>gmt|utc))?"
+        r"(?:\s+(?P<tz>gmt|utc|et|eastern))?"
         r"\s+(?P<day>today|tomorrow)\s*$",
         schedule,
         re.IGNORECASE,
@@ -215,7 +216,15 @@ def _parse_natural_once_schedule(schedule: str) -> Optional[Dict[str, Any]]:
         raise ValueError(f"Invalid schedule '{schedule}': 24-hour clock hour must be 0-23")
 
     tz_name = (match.group("tz") or "").upper()
-    tzinfo = timezone.utc if tz_name in {"GMT", "UTC"} else _hermes_now().tzinfo
+    if tz_name in {"GMT", "UTC"}:
+        tzinfo = timezone.utc
+    elif tz_name in {"ET", "EASTERN"}:
+        try:
+            tzinfo = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            tzinfo = timezone(timedelta(hours=-5))
+    else:
+        tzinfo = _hermes_now().tzinfo
     now = _hermes_now().astimezone(tzinfo)
     run_date = now.date()
     if match.group("day").lower() == "tomorrow":
@@ -224,7 +233,7 @@ def _parse_natural_once_schedule(schedule: str) -> Optional[Dict[str, Any]]:
         hour=hour,
         minute=minute,
     )
-    display_tz = tz_name or str(run_at.tzname() or run_at.tzinfo or "")
+    display_tz = "ET" if tz_name == "EASTERN" else (tz_name or str(run_at.tzname() or run_at.tzinfo or ""))
     return {
         "kind": "once",
         "run_at": run_at.isoformat(),

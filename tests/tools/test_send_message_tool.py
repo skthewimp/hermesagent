@@ -143,6 +143,16 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_whatsapp_jid_is_explicit_target(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref(
+            "whatsapp",
+            "15551234567@s.whatsapp.net",
+        )
+
+        assert chat_id == "15551234567@s.whatsapp.net"
+        assert thread_id is None
+        assert is_explicit is True
+
     def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
         config, telegram_cfg = _make_config()
         cache_file = tmp_path / "channel_directory.json"

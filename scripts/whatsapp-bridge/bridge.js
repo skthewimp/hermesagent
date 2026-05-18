@@ -28,7 +28,7 @@ import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { matchesAllowedUser, parseAllowedUsers, storeWhatsAppIdentifierMapping } from './allowlist.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -50,7 +50,13 @@ const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'docume
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
+const WHATSAPP_TOOL_ONLY =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_TOOL_ONLY === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_TOOL_ONLY.toLowerCase());
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+const MAX_OBSERVED_MESSAGES = parseInt(process.env.WHATSAPP_OBSERVED_MESSAGES || '500', 10);
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -124,6 +130,37 @@ function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
+function isLidJid(value) {
+  return /@(?:hosted\.)?lid$/.test(String(value || ''));
+}
+
+function isPhoneJid(value) {
+  return /@s\.whatsapp\.net$/.test(String(value || ''));
+}
+
+function rememberLidPhoneMapping(first, second) {
+  const a = String(first || '').trim();
+  const b = String(second || '').trim();
+  let stored = false;
+
+  if (isLidJid(a) && isPhoneJid(b)) {
+    stored = storeWhatsAppIdentifierMapping(a, b, SESSION_DIR);
+  } else if (isPhoneJid(a) && isLidJid(b)) {
+    stored = storeWhatsAppIdentifierMapping(b, a, SESSION_DIR);
+  }
+
+  if (stored) {
+    lidToPhone = buildLidMap();
+    if (WHATSAPP_DEBUG) {
+      try {
+        console.log(JSON.stringify({ event: 'lid_mapping_stored', first: a, second: b }));
+      } catch {}
+    }
+  }
+
+  return stored;
+}
+
 function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
@@ -169,6 +206,7 @@ const logger = pino({ level: 'warn' });
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
+const observedMessages = [];
 
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
@@ -199,6 +237,16 @@ async function startSocket() {
   });
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+
+  sock.ev.on('lid-mapping.update', ({ lid, pn }) => {
+    rememberLidPhoneMapping(lid, pn);
+  });
+
+  sock.ev.on('messaging-history.set', ({ lidPnMappings = [] }) => {
+    for (const { lid, pn } of lidPnMappings) {
+      rememberLidPhoneMapping(lid, pn);
+    }
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -250,6 +298,8 @@ async function startSocket() {
       if (!msg.message) continue;
 
       const chatId = msg.key.remoteJid;
+      rememberLidPhoneMapping(msg.key.remoteJid, msg.key.remoteJidAlt);
+      rememberLidPhoneMapping(msg.key.participant, msg.key.participantAlt);
       if (WHATSAPP_DEBUG) {
         try {
           console.log(JSON.stringify({
@@ -264,53 +314,59 @@ async function startSocket() {
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
 
-      // Handle fromMe messages based on mode
-      if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) continue;
-
-        if (WHATSAPP_MODE === 'bot') {
-          // Bot mode: separate number. ALL fromMe are echo-backs of our own replies — skip.
-          continue;
-        }
-
-        // Self-chat mode: only allow messages in the user's own self-chat
-        // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
-        // AND classic format: 34652029134@s.whatsapp.net
-        // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
-        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const chatNumber = chatId.replace(/@.*/, '');
-        const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
-        if (!isSelfChat) continue;
+      if (chatId.includes('status') || chatId.endsWith('@broadcast') || chatId.endsWith('@newsletter')) {
+        continue;
       }
 
-      // Handle !fromMe messages (from other people) based on mode.
-      // Self-chat mode only responds to the user's own messages to
-      // themselves — stranger DMs / group pings must never reach the
-      // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
-      if (!msg.key.fromMe) {
-        if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
+      if (!WHATSAPP_TOOL_ONLY) {
+        // Handle fromMe messages based on mode
+        if (msg.key.fromMe) {
+          if (isGroup) continue;
+
+          if (WHATSAPP_MODE === 'bot') {
+            // Bot mode: separate number. ALL fromMe are echo-backs of our own replies — skip.
+            continue;
+          }
+
+          // Self-chat mode: only allow messages in the user's own self-chat
+          // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
+          // AND classic format: 34652029134@s.whatsapp.net
+          // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
+          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const chatNumber = chatId.replace(/@.*/, '');
+          const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+          if (!isSelfChat) continue;
         }
-        if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
+
+        // Handle !fromMe messages (from other people) based on mode.
+        // Self-chat mode only responds to the user's own messages to
+        // themselves — stranger DMs / group pings must never reach the
+        // Python gateway, otherwise a pairing-code reply fires in response
+        // to arbitrary incoming messages (#8389).
+        if (!msg.key.fromMe) {
+          if (WHATSAPP_MODE === 'self-chat') {
+            try {
+              console.log(JSON.stringify({
+                event: 'ignored',
+                reason: 'self_chat_mode_rejects_non_self',
+                chatId,
+                senderId,
+              }));
+            } catch {}
+            continue;
+          }
+          if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+            try {
+              console.log(JSON.stringify({
+                event: 'ignored',
+                reason: 'allowlist_mismatch',
+                chatId,
+                senderId,
+              }));
+            } catch {}
+            continue;
+          }
         }
       }
 
@@ -440,6 +496,20 @@ async function startSocket() {
         timestamp: msg.messageTimestamp,
       };
 
+      observedMessages.push({
+        observedAt: new Date().toISOString(),
+        upsertType: type,
+        direction: msg.key.fromMe ? 'outgoing' : 'incoming',
+        ...event,
+      });
+      while (observedMessages.length > MAX_OBSERVED_MESSAGES) {
+        observedMessages.shift();
+      }
+
+      if (WHATSAPP_TOOL_ONLY) {
+        continue;
+      }
+
       messageQueue.push(event);
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
@@ -487,6 +557,33 @@ app.use((req, res, next) => {
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
   res.json(msgs);
+});
+
+// Non-destructive, in-memory view for tool-only WhatsApp analysis.
+app.get('/observed', (req, res) => {
+  const limitRaw = parseInt(String(req.query.limit || '50'), 10);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 200)) : 50;
+  const direction = String(req.query.direction || 'all').toLowerCase();
+  const query = String(req.query.query || '').toLowerCase();
+  const chat = String(req.query.chat || '').toLowerCase();
+
+  let rows = observedMessages;
+  if (direction === 'incoming' || direction === 'outgoing') {
+    rows = rows.filter((msg) => msg.direction === direction);
+  }
+  if (query) {
+    rows = rows.filter((msg) => String(msg.body || '').toLowerCase().includes(query));
+  }
+  if (chat) {
+    rows = rows.filter((msg) => {
+      const haystack = [
+        msg.chatId, msg.senderId, msg.chatName, msg.senderName,
+      ].map((value) => String(value || '').toLowerCase()).join(' ');
+      return haystack.includes(chat);
+    });
+  }
+
+  res.json(rows.slice(-limit));
 });
 
 // Send a message
@@ -722,6 +819,9 @@ if (PAIR_ONLY) {
       console.log(`🔒 No WHATSAPP_ALLOWED_USERS set — incoming messages are rejected.`);
       console.log(`   Set WHATSAPP_ALLOWED_USERS=<phone> to authorize specific users,`);
       console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
+    }
+    if (WHATSAPP_TOOL_ONLY) {
+      console.log(`🧰 Tool-only mode — observed WhatsApp messages stay in memory and are not sent to Hermes as chat input.`);
     }
     console.log();
     startSocket();

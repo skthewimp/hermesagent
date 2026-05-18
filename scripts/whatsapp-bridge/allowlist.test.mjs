@@ -2,13 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 
 import {
   expandWhatsAppIdentifiers,
   matchesAllowedUser,
   normalizeWhatsAppIdentifier,
   parseAllowedUsers,
+  storeWhatsAppIdentifierMapping,
 } from './allowlist.js';
 
 test('normalizeWhatsAppIdentifier strips jid syntax and plus prefix', () => {
@@ -74,6 +75,40 @@ test('matchesAllowedUser rejects everyone when allowlist is empty (#8389)', () =
     // Null/undefined allowlist (defensive) also rejects.
     assert.equal(matchesAllowedUser('19175395595@s.whatsapp.net', null, sessionDir), false);
     assert.equal(matchesAllowedUser('19175395595@s.whatsapp.net', undefined, sessionDir), false);
+  } finally {
+    rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test('storeWhatsAppIdentifierMapping persists phone and lid aliases', () => {
+  const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-allowlist-'));
+
+  try {
+    assert.equal(
+      storeWhatsAppIdentifierMapping('267383306489914@lid', '+19175395595@s.whatsapp.net', sessionDir),
+      true,
+    );
+
+    const phonePath = path.join(sessionDir, 'lid-mapping-19175395595.json');
+    const lidPath = path.join(sessionDir, 'lid-mapping-267383306489914_reverse.json');
+    assert.equal(existsSync(phonePath), true);
+    assert.equal(existsSync(lidPath), true);
+    assert.equal(JSON.parse(readFileSync(phonePath, 'utf8')), '267383306489914');
+    assert.equal(JSON.parse(readFileSync(lidPath, 'utf8')), '19175395595');
+
+    const allowedUsers = parseAllowedUsers('19175395595');
+    assert.equal(matchesAllowedUser('267383306489914@lid', allowedUsers, sessionDir), true);
+  } finally {
+    rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test('storeWhatsAppIdentifierMapping rejects non-numeric identifiers', () => {
+  const sessionDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-wa-allowlist-'));
+
+  try {
+    assert.equal(storeWhatsAppIdentifierMapping('../bad@lid', '19175395595@s.whatsapp.net', sessionDir), false);
+    assert.equal(storeWhatsAppIdentifierMapping('267383306489914@lid', 'not-a-phone@s.whatsapp.net', sessionDir), false);
   } finally {
     rmSync(sessionDir, { recursive: true, force: true });
   }

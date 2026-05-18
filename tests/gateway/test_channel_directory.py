@@ -173,6 +173,16 @@ class TestResolveChannelName:
             assert resolve_channel_name("telegram", "Dev Group (group)") == "456"
             assert resolve_channel_name("telegram", "Coaching Chat / topic 17585 (group)") == "-1001:17585"
 
+    def test_whatsapp_contact_display_label_resolves(self, tmp_path):
+        platforms = {
+            "whatsapp": [
+                {"id": "15551234567@s.whatsapp.net", "name": "Alex", "type": "contact"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("whatsapp", "Alex") == "15551234567@s.whatsapp.net"
+            assert resolve_channel_name("whatsapp", "Alex (contact)") == "15551234567@s.whatsapp.net"
+
 
 class TestBuildFromSessions:
     def _write_sessions(self, tmp_path, sessions_data):
@@ -230,6 +240,23 @@ class TestBuildFromSessions:
             entries = _build_from_sessions("telegram")
 
         assert len(entries) == 1
+
+    def test_build_whatsapp_includes_contacts_file(self, tmp_path, monkeypatch):
+        contacts = tmp_path / "whatsapp_contacts.json"
+        contacts.write_text(json.dumps({"Alex": "+15551234567"}), encoding="utf-8")
+        monkeypatch.setenv("WHATSAPP_CONTACTS_FILE", str(contacts))
+
+        cache_file = tmp_path / "channel_directory.json"
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            directory = asyncio.run(build_channel_directory({}))
+
+        assert directory["platforms"]["whatsapp"] == [
+            {
+                "id": "15551234567@s.whatsapp.net",
+                "name": "Alex",
+                "type": "contact",
+            }
+        ]
 
     def test_keeps_distinct_topics_with_same_chat_id(self, tmp_path):
         self._write_sessions(tmp_path, {

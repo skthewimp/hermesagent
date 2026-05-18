@@ -399,6 +399,67 @@ class TestUnifiedCronjobTool:
             "following up on our conversation last week"
         )
 
+    def test_create_rewrites_whatsapp_message_job_to_delivery(self, tmp_path, monkeypatch):
+        from cron.jobs import get_job
+
+        directory_path = tmp_path / "channel_directory.json"
+        directory_path.write_text(
+            json.dumps(
+                {
+                    "updated_at": "2026-05-18T00:00:00",
+                    "platforms": {
+                        "whatsapp": [
+                            {
+                                "id": "15551234567@s.whatsapp.net",
+                                "name": "Alex",
+                                "type": "contact",
+                            }
+                        ]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("gateway.channel_directory.DIRECTORY_PATH", directory_path)
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt=(
+                    "At 9am ET send the message 'hey, how are you doing' "
+                    "to Alex on WhatsApp"
+                ),
+                schedule="at 9am ET today",
+                name="message_alex",
+            )
+        )
+
+        assert result["success"] is True
+        assert result["deliver"] == "whatsapp:Alex"
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "whatsapp:Alex"
+        assert stored["prompt"] == (
+            "Output exactly this text and nothing else:\n"
+            "hey, how are you doing"
+        )
+
+    def test_create_rewrites_whatsapp_message_with_existing_delivery(self):
+        from cron.jobs import get_job
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="At 9am ET send the message 'hey' to Alex on WhatsApp",
+                schedule="at 9am ET today",
+                deliver="whatsapp:15551234567@s.whatsapp.net",
+            )
+        )
+
+        assert result["success"] is True
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "whatsapp:15551234567@s.whatsapp.net"
+        assert stored["prompt"] == "Output exactly this text and nothing else:\nhey"
+
     def test_multi_skill_default_name_prefers_prompt_when_present(self):
         result = json.loads(
             cronjob(

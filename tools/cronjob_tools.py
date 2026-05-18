@@ -275,6 +275,75 @@ def _coerce_scheduled_email_delivery(
     return rewritten_prompt, f"email:{email}", rewritten_skills
 
 
+def _extract_scheduled_whatsapp_message(text: str) -> tuple[str, str]:
+    patterns = [
+        r"(?:send|text|message)\s+(?:the\s+)?(?:message|text)\s*"
+        r"[\"'“‘](?P<body>.+?)[\"'”’]\s+to\s+(?P<target>.+?)"
+        r"(?:\s+(?:on|via|over)\s+whatsapp)?\s*\Z",
+        r"(?:send|text|message)\s+(?P<target>.+?)\s+(?:the\s+)?(?:message|text)\s*"
+        r"[\"'“‘](?P<body>.+?)[\"'”’]"
+        r"(?:\s+(?:on|via|over)\s+whatsapp)?\s*\Z",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        target = match.group("target").strip().strip("\"'“”‘’")
+        body = match.group("body").strip()
+        if target and body:
+            return target, body
+    return "", ""
+
+
+def _is_whatsapp_target_known(target: str) -> bool:
+    if target.lower().startswith("whatsapp:"):
+        return True
+    if "@" in target:
+        return True
+    compact = target.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    if compact.startswith("+"):
+        compact = compact[1:]
+    if compact.isdigit():
+        return True
+    try:
+        from gateway.channel_directory import resolve_channel_name
+        return bool(resolve_channel_name("whatsapp", target))
+    except Exception:
+        return False
+
+
+def _coerce_scheduled_whatsapp_delivery(
+    *,
+    prompt: Optional[str],
+    deliver: Optional[str],
+    skills: List[str],
+) -> tuple[Optional[str], Optional[str], List[str]]:
+    """Rewrite scheduled WhatsApp message intents into cron auto-delivery."""
+    normalized_deliver = _normalize_deliver_param(deliver)
+    text = str(prompt or "").strip()
+    explicit_whatsapp = re.search(r"\b(?:whatsapp|wa)\b", text, re.IGNORECASE)
+    target, body = _extract_scheduled_whatsapp_message(text)
+    if not target or not body:
+        return prompt, normalized_deliver, skills
+
+    if normalized_deliver:
+        if normalized_deliver.lower().startswith("whatsapp:"):
+            rewritten_prompt = f"Output exactly this text and nothing else:\n{body}"
+            return rewritten_prompt, normalized_deliver, skills
+        return prompt, normalized_deliver, skills
+
+    if not explicit_whatsapp and not _is_whatsapp_target_known(target):
+        return prompt, normalized_deliver, skills
+
+    if target.lower().startswith("whatsapp:"):
+        delivery_target = target
+    else:
+        delivery_target = f"whatsapp:{target}"
+    rewritten_prompt = f"Output exactly this text and nothing else:\n{body}"
+    logger.info("Rewrote scheduled WhatsApp prompt to cron delivery target %s", delivery_target)
+    return rewritten_prompt, delivery_target, skills
+
+
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     """Validate a cron job script path at the API boundary.
 
@@ -384,6 +453,11 @@ def cronjob(
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
             prompt, deliver, canonical_skills = _coerce_scheduled_email_delivery(
+                prompt=prompt,
+                deliver=deliver,
+                skills=canonical_skills,
+            )
+            prompt, deliver, canonical_skills = _coerce_scheduled_whatsapp_delivery(
                 prompt=prompt,
                 deliver=deliver,
                 skills=canonical_skills,
@@ -637,6 +711,11 @@ agent to send mail. Instead set deliver='email:recipient@example.com' and make
 the prompt output the exact email content, including a leading Subject: header.
 Example prompt: "Output exactly this text and nothing else:\nSubject: Hello\n\nBody text"
 
+For scheduled WhatsApp requests, do NOT ask the future cron agent to call
+send_message. Instead set deliver='whatsapp:contact-name-or-phone' and make
+the prompt output exactly the message text. WhatsApp contact names are resolved
+from the channel directory and `~/.hermes/whatsapp_contacts.json`.
+
 Important safety rule: cron-run sessions should not recursively schedule more cron jobs.""",
     "parameters": {
         "type": "object",
@@ -667,7 +746,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. For scheduled email, set 'email:recipient@example.com' and do not attach email skills. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'email:user@example.com', 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
+                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. For scheduled email, set 'email:recipient@example.com' and do not attach email skills. For scheduled WhatsApp, set 'whatsapp:contact-name-or-phone' and make the prompt output exactly the message text. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'email:user@example.com', 'whatsapp:Alex', 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
             },
             "skills": {
                 "type": "array",

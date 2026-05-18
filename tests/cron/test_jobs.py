@@ -123,6 +123,16 @@ class TestParseSchedule:
         assert result["kind"] == "once"
         assert result["run_at"] == "2026-05-19T14:05:00+00:00"
 
+    def test_natural_et_today(self, monkeypatch):
+        now = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        result = parse_schedule("at 9am ET today")
+
+        assert result["kind"] == "once"
+        assert result["run_at"] == "2026-05-18T09:00:00-04:00"
+        assert result["display"] == "once at 2026-05-18 09:00 ET"
+
     def test_invalid_schedule_raises(self):
         with pytest.raises(ValueError):
             parse_schedule("not_a_schedule")

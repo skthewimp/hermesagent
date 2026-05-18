@@ -360,6 +360,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
     if platform_name in _PHONE_PLATFORMS:
+        if platform_name == "whatsapp" and "@" in target_ref:
+            return target_ref.strip(), None, True
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
             # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
@@ -1170,10 +1172,17 @@ async def _send_whatsapp(extra, chat_id, message):
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         bridge_port = extra.get("bridge_port", 3000)
+        target_chat_id = str(chat_id or "").strip()
+        if "@" not in target_chat_id:
+            digits = target_chat_id.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+            if digits.startswith("+"):
+                digits = digits[1:]
+            if digits.isdigit():
+                target_chat_id = f"{digits}@s.whatsapp.net"
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"http://localhost:{bridge_port}/send",
-                json={"chatId": chat_id, "message": message},
+                json={"chatId": target_chat_id, "message": message},
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 200:
@@ -1181,7 +1190,7 @@ async def _send_whatsapp(extra, chat_id, message):
                     return {
                         "success": True,
                         "platform": "whatsapp",
-                        "chat_id": chat_id,
+                        "chat_id": target_chat_id,
                         "message_id": data.get("messageId"),
                     }
                 body = await resp.text()
