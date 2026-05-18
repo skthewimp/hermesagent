@@ -311,11 +311,18 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `EMAIL_IMAP_PORT` | IMAP port |
 | `EMAIL_SMTP_HOST` | SMTP hostname for the email adapter |
 | `EMAIL_SMTP_PORT` | SMTP port |
+| `EMAIL_SEND_MODE` | Outbound email mode. Set to `gmail_api` to send through Gmail API instead of SMTP |
+| `EMAIL_SMTP_TIMEOUT` | SMTP send timeout in seconds |
 | `EMAIL_ALLOWED_USERS` | Comma-separated email addresses allowed to message the bot |
 | `EMAIL_HOME_ADDRESS` | Default recipient for proactive email delivery |
 | `EMAIL_HOME_ADDRESS_NAME` | Display name for the email home target |
 | `EMAIL_POLL_INTERVAL` | Email polling interval in seconds |
 | `EMAIL_ALLOW_ALL_USERS` | Allow all inbound email senders |
+| `GMAIL_CREDENTIALS_FILE` | Gmail OAuth client JSON path for Gmail API sending |
+| `GMAIL_TOKEN_FILE` | Saved Gmail OAuth token path |
+| `GMAIL_CONTACTS_FILE` | Optional Gmail API contact-name mapping JSON path |
+| `GMAIL_OAUTH_PORT` | Local OAuth callback port for Gmail API setup |
+| `EMAIL_ACTIONS_DB` | SQLite database path for Gmail draft/send action history |
 | `DINGTALK_CLIENT_ID` | DingTalk bot AppKey from developer portal ([open.dingtalk.com](https://open.dingtalk.com)) |
 | `DINGTALK_CLIENT_SECRET` | DingTalk bot AppSecret from developer portal |
 | `DINGTALK_ALLOWED_USERS` | Comma-separated DingTalk user IDs allowed to message the bot |

@@ -272,6 +272,133 @@ class TestUnifiedCronjobTool:
         listing = json.loads(cronjob(action="list"))
         assert listing["jobs"][0]["skills"] == ["blogwatcher", "maps"]
 
+    def test_create_rewrites_himalaya_email_job_to_delivery(self):
+        from cron.jobs import get_job
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                skills=["email:himalaya"],
+                prompt=(
+                    "Use himalaya via the terminal tool to send an email to "
+                    "person@example.com with subject exactly: I love you\n\n"
+                    "Body:\nhello there"
+                ),
+                schedule="at 2pm GMT today",
+                name="send_email_person",
+            )
+        )
+
+        assert result["success"] is True
+        assert result["deliver"] == "email:person@example.com"
+        assert result["skills"] == []
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "email:person@example.com"
+        assert stored["skills"] == []
+        assert stored["prompt"] == (
+            "Output exactly this text and nothing else:\n"
+            "Subject: I love you\n\n"
+            "hello there"
+        )
+
+    def test_create_rewrites_exact_text_email_job_without_email_skill(self):
+        from cron.jobs import get_job
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt=(
+                    "At 2pm GMT today, email person@example.com with this exact text: "
+                    "'following up on our conversation last week' and this exact "
+                    "subject line 'ai implementation'"
+                ),
+                schedule="at 2pm GMT today",
+                name="email_person",
+            )
+        )
+
+        assert result["success"] is True
+        assert result["deliver"] == "email:person@example.com"
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "email:person@example.com"
+        assert stored["prompt"] == (
+            "Output exactly this text and nothing else:\n"
+            "Subject: ai implementation\n\n"
+            "following up on our conversation last week"
+        )
+
+    def test_create_rewrites_exact_subject_before_text_email_job(self):
+        from cron.jobs import get_job
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                skills=["email:himalaya"],
+                prompt=(
+                    "Email person@example.com with exact subject line \"ai implementation\" "
+                    "and exact text \"following up on our conversation last week\""
+                ),
+                schedule="at 2pm GMT today",
+            )
+        )
+
+        assert result["success"] is True
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "email:person@example.com"
+        assert stored["skills"] == []
+        assert stored["prompt"] == (
+            "Output exactly this text and nothing else:\n"
+            "Subject: ai implementation\n\n"
+            "following up on our conversation last week"
+        )
+
+    def test_create_treats_quoted_subject_and_body_as_exact(self):
+        from cron.jobs import get_job
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt=(
+                    "At 2pm GMT today, email person@example.com with text "
+                    "'following up on our conversation last week' and subject "
+                    "'ai implementation'"
+                ),
+                schedule="at 2pm GMT today",
+            )
+        )
+
+        assert result["success"] is True
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "email:person@example.com"
+        assert stored["prompt"] == (
+            "Output exactly this text and nothing else:\n"
+            "Subject: ai implementation\n\n"
+            "following up on our conversation last week"
+        )
+
+    def test_create_treats_quoted_subject_before_body_as_exact(self):
+        from cron.jobs import get_job
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt=(
+                    "Email person@example.com with subject \"ai implementation\" "
+                    "and body \"following up on our conversation last week\""
+                ),
+                schedule="at 2pm GMT today",
+            )
+        )
+
+        assert result["success"] is True
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "email:person@example.com"
+        assert stored["prompt"] == (
+            "Output exactly this text and nothing else:\n"
+            "Subject: ai implementation\n\n"
+            "following up on our conversation last week"
+        )
+
     def test_multi_skill_default_name_prefers_prompt_when_present(self):
         result = json.loads(
             cronjob(

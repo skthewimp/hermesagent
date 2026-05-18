@@ -14,7 +14,7 @@ import threading
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Union
@@ -181,6 +181,57 @@ def parse_duration(s: str) -> int:
     return value * multipliers[unit]
 
 
+def _parse_natural_once_schedule(schedule: str) -> Optional[Dict[str, Any]]:
+    """Parse simple human one-shot schedules like ``at 2pm GMT today``.
+
+    This intentionally stays small and deterministic.  It covers the chat
+    shape users naturally send for one-off reminders without introducing a
+    broad natural-language date parser into cron scheduling.
+    """
+    match = re.match(
+        r"^\s*(?:at\s+)?"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?"
+        r"(?:\s+(?P<tz>gmt|utc))?"
+        r"\s+(?P<day>today|tomorrow)\s*$",
+        schedule,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or "0")
+    ampm = (match.group("ampm") or "").lower()
+    if minute > 59:
+        raise ValueError(f"Invalid schedule '{schedule}': minute must be 00-59")
+    if ampm:
+        if hour < 1 or hour > 12:
+            raise ValueError(f"Invalid schedule '{schedule}': 12-hour clock hour must be 1-12")
+        if ampm == "am":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+    elif hour > 23:
+        raise ValueError(f"Invalid schedule '{schedule}': 24-hour clock hour must be 0-23")
+
+    tz_name = (match.group("tz") or "").upper()
+    tzinfo = timezone.utc if tz_name in {"GMT", "UTC"} else _hermes_now().tzinfo
+    now = _hermes_now().astimezone(tzinfo)
+    run_date = now.date()
+    if match.group("day").lower() == "tomorrow":
+        run_date = run_date + timedelta(days=1)
+    run_at = datetime.combine(run_date, datetime.min.time(), tzinfo=tzinfo).replace(
+        hour=hour,
+        minute=minute,
+    )
+    display_tz = tz_name or str(run_at.tzname() or run_at.tzinfo or "")
+    return {
+        "kind": "once",
+        "run_at": run_at.isoformat(),
+        "display": f"once at {run_at.strftime('%Y-%m-%d %H:%M')} {display_tz}".strip(),
+    }
+
+
 def parse_schedule(schedule: str) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
@@ -231,6 +282,10 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             "expr": schedule,
             "display": schedule
         }
+
+    natural_once = _parse_natural_once_schedule(schedule)
+    if natural_once:
+        return natural_once
     
     # ISO timestamp (contains T or looks like date)
     if 'T' in schedule or re.match(r'^\d{4}-\d{2}-\d{2}', schedule):

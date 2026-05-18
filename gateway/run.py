@@ -6669,6 +6669,9 @@ class GatewayRunner:
         if canonical == "draft_emails":
             return await self._handle_draft_emails_command(event)
 
+        if canonical == "cron":
+            return await self._handle_cron_command(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -10084,6 +10087,203 @@ class GatewayRunner:
                 f"- #{action.id} [{action.status}] To: {recipients} | Subject: {action.subject}"
             )
         return "\n".join(lines)
+
+    async def _handle_cron_command(self, event: MessageEvent) -> str:
+        """Handle /cron in gateway chats using the same cronjob backend as the CLI.
+
+        Supported forms:
+          /cron list
+          /cron add "10m" "Remind me to stretch" --deliver origin
+          /cron edit <id> --schedule "every day at 9am" --prompt "..."
+          /cron pause|resume|run|remove <id>
+        """
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return (
+                "Usage:\n"
+                '/cron add "10m" "Remind me to stretch"\n'
+                "/cron list\n"
+                "/cron pause <job_id> | resume <job_id> | run <job_id> | remove <job_id>\n"
+                '/cron edit <job_id> --schedule "every day at 9am" --prompt "..."'
+            )
+
+        try:
+            parts = shlex.split(raw_args)
+        except ValueError as exc:
+            return f"/cron: could not parse arguments: {exc}"
+        if not parts:
+            return "Usage: /cron add <schedule> <prompt>"
+
+        action = parts[0].lower()
+        if action == "add":
+            action = "create"
+        elif action in {"rm", "delete"}:
+            action = "remove"
+
+        opts: Dict[str, Any] = {}
+        positionals: List[str] = []
+        i = 1
+        while i < len(parts):
+            token = parts[i]
+            if token.startswith("--"):
+                key = token[2:].replace("-", "_")
+                if key in {"all", "include_disabled", "no_agent", "agent", "clear_skills"}:
+                    if key == "all":
+                        opts["include_disabled"] = True
+                    elif key == "agent":
+                        opts["no_agent"] = False
+                    else:
+                        opts[key] = True
+                    i += 1
+                    continue
+                if i + 1 >= len(parts):
+                    return f"/cron: option {token} requires a value"
+                value = parts[i + 1]
+                if key in {"skill", "add_skill", "remove_skill"}:
+                    opts.setdefault(key + "s", []).append(value)
+                else:
+                    opts[key] = value
+                i += 2
+            else:
+                positionals.append(token)
+                i += 1
+
+        payload: Dict[str, Any] = {"action": action}
+        if action == "create":
+            if len(positionals) < 2:
+                return 'Usage: /cron add "10m" "Remind me to stretch"'
+            schedule, prompt = self._parse_cron_create_positionals(positionals)
+            if not prompt:
+                return 'Usage: /cron add "10m" "Remind me to stretch"'
+            payload.update({
+                "schedule": schedule,
+                "prompt": prompt,
+                "name": opts.get("name"),
+                "deliver": opts.get("deliver") or "origin",
+                "repeat": int(opts["repeat"]) if opts.get("repeat") else None,
+                "skills": opts.get("skills"),
+                "script": opts.get("script"),
+                "workdir": opts.get("workdir"),
+                "no_agent": opts.get("no_agent"),
+            })
+        elif action == "list":
+            payload["include_disabled"] = bool(opts.get("include_disabled"))
+        elif action == "status":
+            payload["action"] = "list"
+            payload["include_disabled"] = True
+        elif action == "edit":
+            if not positionals:
+                return 'Usage: /cron edit <job_id> --schedule "..." --prompt "..."'
+            payload.update({
+                "action": "update",
+                "job_id": positionals[0],
+                "schedule": opts.get("schedule"),
+                "prompt": opts.get("prompt"),
+                "name": opts.get("name"),
+                "deliver": opts.get("deliver"),
+                "repeat": int(opts["repeat"]) if opts.get("repeat") else None,
+                "skills": opts.get("skills"),
+                "script": opts.get("script"),
+                "workdir": opts.get("workdir"),
+                "no_agent": opts.get("no_agent"),
+            })
+        elif action in {"pause", "resume", "run", "remove"}:
+            if not positionals:
+                return f"Usage: /cron {action} <job_id>"
+            payload["job_id"] = positionals[0]
+        else:
+            return "Unknown /cron action. Use: list, add, edit, pause, resume, run, remove, status."
+
+        try:
+            from gateway.session_context import clear_session_vars, set_session_vars
+            from tools.cronjob_tools import cronjob
+
+            platform_value = getattr(event.source.platform, "value", event.source.platform)
+            tokens = set_session_vars(
+                platform=str(platform_value or ""),
+                chat_id=str(getattr(event.source, "chat_id", "") or ""),
+                chat_name=str(getattr(event.source, "chat_name", "") or ""),
+                thread_id=str(getattr(event.source, "thread_id", "") or ""),
+                user_id=str(getattr(event.source, "user_id", "") or ""),
+                user_name=str(getattr(event.source, "user_name", "") or ""),
+                session_key=str(getattr(event.source, "session_key", "") or ""),
+            )
+            try:
+                result = json.loads(cronjob(**{k: v for k, v in payload.items() if v is not None}))
+            finally:
+                clear_session_vars(tokens)
+        except Exception as exc:
+            logger.warning("/cron command failed: %s", exc, exc_info=True)
+            return f"/cron failed: {exc}"
+
+        return self._format_cron_result(result, status=(action == "status"))
+
+    def _parse_cron_create_positionals(self, positionals: List[str]) -> tuple[str, str]:
+        """Split /cron add positional args into schedule + prompt.
+
+        Accepts both shell-like quoted forms and common chat shorthand:
+        ``/cron add 10m remind me`` and ``/cron add in 2 minutes remind me``.
+        """
+        if not positionals:
+            return "", ""
+
+        def _unit_suffix(unit: str) -> str:
+            normalized = unit.lower().rstrip("s")
+            return {
+                "minute": "m",
+                "min": "m",
+                "m": "m",
+                "hour": "h",
+                "hr": "h",
+                "h": "h",
+                "day": "d",
+                "d": "d",
+            }.get(normalized, normalized)
+
+        first = positionals[0].lower()
+        if first == "in" and len(positionals) >= 4:
+            return f"{positionals[1]}{_unit_suffix(positionals[2])}", " ".join(positionals[3:]).strip()
+        if first == "every" and len(positionals) >= 4:
+            return f"every {positionals[1]}{_unit_suffix(positionals[2])}", " ".join(positionals[3:]).strip()
+        return positionals[0], " ".join(positionals[1:]).strip()
+
+    def _format_cron_result(self, result: Dict[str, Any], *, status: bool = False) -> str:
+        if not result.get("success"):
+            return f"/cron failed: {result.get('error', 'unknown error')}"
+
+        if "jobs" in result:
+            jobs = result.get("jobs") or []
+            if status:
+                active = [j for j in jobs if j.get("enabled", True) and j.get("state") != "paused"]
+                return f"Cron scheduler is handled by the gateway. Jobs: {len(active)} active, {len(jobs)} total."
+            if not jobs:
+                return "No scheduled jobs."
+            lines = ["Scheduled jobs:"]
+            for job in jobs[:20]:
+                state = job.get("state") or ("active" if job.get("enabled", True) else "paused")
+                deliver = job.get("deliver", "local")
+                if isinstance(deliver, list):
+                    deliver = ", ".join(str(d) for d in deliver)
+                lines.append(
+                    f"- {job.get('job_id')} [{state}] {job.get('name')} | "
+                    f"{job.get('schedule')} | next: {job.get('next_run_at')} | deliver: {deliver}"
+                )
+            if len(jobs) > 20:
+                lines.append(f"...and {len(jobs) - 20} more.")
+            return "\n".join(lines)
+
+        if result.get("job_id"):
+            lines = [result.get("message") or "Cron job updated."]
+            lines.append(f"ID: {result.get('job_id')}")
+            if result.get("schedule"):
+                lines.append(f"Schedule: {result.get('schedule')}")
+            if result.get("next_run_at"):
+                lines.append(f"Next run: {result.get('next_run_at')}")
+            if result.get("deliver"):
+                lines.append(f"Deliver: {result.get('deliver')}")
+            return "\n".join(lines)
+
+        return result.get("message") or json.dumps(result, indent=2)
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""

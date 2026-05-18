@@ -986,6 +986,60 @@ class TestSendEmailStandalone(unittest.TestCase):
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
         "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+    })
+    def test_send_email_tool_subject_header(self):
+        """_send_email should honor a leading Subject: header."""
+        import asyncio
+        from tools.send_message_tool import _send_email
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(
+                _send_email(
+                    {"address": "hermes@test.com", "smtp_host": "smtp.test.com"},
+                    "user@test.com",
+                    "Subject: Follow up\n\nCan you send the notes?",
+                )
+            )
+
+            self.assertTrue(result["success"])
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["Subject"], "Follow up")
+            self.assertEqual(send_call.get_payload(decode=True).decode("utf-8"), "Can you send the notes?")
+            mock_smtp.assert_called_once_with("smtp.test.com", 587, timeout=15.0)
+
+    @patch.dict(os.environ, {
+        "EMAIL_SEND_MODE": "gmail_api",
+    }, clear=True)
+    def test_send_email_tool_gmail_api_mode(self):
+        """_send_email should support Gmail API delivery when SMTP is blocked."""
+        import asyncio
+        from tools.send_message_tool import _send_email
+
+        with patch("gateway.platforms.gmail_actions.send_email", return_value={"id": "msg-1"}) as send_mock:
+            result = asyncio.run(
+                _send_email(
+                    {},
+                    "user@test.com",
+                    "Subject: Follow up\n\nCan you send the notes?",
+                )
+            )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["provider"], "gmail_api")
+            send_mock.assert_called_once_with(
+                recipients=["user@test.com"],
+                subject="Follow up",
+                body="Can you send the notes?",
+            )
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
     })
     def test_send_email_tool_failure(self):
         """SMTP failure should return error dict."""

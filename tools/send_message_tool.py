@@ -70,6 +70,21 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
+def _split_email_subject_body(message: str) -> tuple[str, str]:
+    """Extract a leading RFC-like Subject header from a plain text message."""
+    subject = "Hermes Agent"
+    body = message
+    match = re.match(
+        r"\s*Subject:\s*(.+?)\s*(?:\r?\n){2,}(.*)\Z",
+        message,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if match:
+        subject = match.group(1).strip()[:998] or subject
+        body = match.group(2).strip()
+    return subject, body
+
+
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
@@ -1362,6 +1377,17 @@ async def _send_email(extra, chat_id, message):
     from email.mime.text import MIMEText
     from email.utils import formatdate
 
+    subject, body = _split_email_subject_body(message)
+    send_mode = (os.getenv("EMAIL_SEND_MODE") or extra.get("send_mode") or "smtp").strip().lower()
+    if send_mode in {"gmail_api", "gmail-api", "gmail"}:
+        try:
+            from gateway.platforms.gmail_actions import send_email
+
+            send_email(recipients=[chat_id], subject=subject, body=body)
+            return {"success": True, "platform": "email", "chat_id": chat_id, "provider": "gmail_api"}
+        except Exception as e:
+            return _error(f"Gmail API send failed: {e}")
+
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
     password = os.getenv("EMAIL_PASSWORD", "")
     smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
@@ -1369,18 +1395,22 @@ async def _send_email(extra, chat_id, message):
         smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
     except (ValueError, TypeError):
         smtp_port = 587
+    try:
+        smtp_timeout = float(os.getenv("EMAIL_SMTP_TIMEOUT", "15"))
+    except (ValueError, TypeError):
+        smtp_timeout = 15.0
 
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        msg["Subject"] = subject
         msg["Date"] = formatdate(localtime=True)
 
-        server = smtplib.SMTP(smtp_host, smtp_port)
+        server = smtplib.SMTP(smtp_host, smtp_port, timeout=smtp_timeout)
         server.starttls(context=ssl.create_default_context())
         server.login(address, password)
         server.send_message(msg)

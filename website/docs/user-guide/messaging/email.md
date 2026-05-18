@@ -8,6 +8,8 @@ description: "Set up Hermes Agent as an email assistant via IMAP/SMTP"
 
 Hermes can receive and reply to emails using standard IMAP and SMTP protocols. Send an email to the agent's address and it replies in-thread — no special client or bot API needed. Works with Gmail, Outlook, Yahoo, Fastmail, or any provider that supports IMAP/SMTP.
 
+Hermes can also send outbound Gmail through the Gmail API. This is useful when SMTP/IMAP egress is blocked or when you want scheduled Telegram commands to send email without configuring a local mail client.
+
 :::info No External Dependencies
 The Email adapter uses Python's built-in `imaplib`, `smtplib`, and `email` modules. No additional packages or external services are required.
 :::
@@ -74,6 +76,36 @@ EMAIL_POLL_INTERVAL=15                 # Seconds between inbox checks (default: 
 EMAIL_HOME_ADDRESS=your@email.com      # Default delivery target for cron jobs
 ```
 
+### Gmail API Outbound Mode
+
+For outbound-only Gmail delivery, configure Gmail API OAuth and set:
+
+```bash
+EMAIL_SEND_MODE=gmail_api
+```
+
+Then scheduled jobs and `send_message` email delivery use the Gmail API instead of SMTP. This does not enable inbound email polling; inbound email still uses the IMAP adapter above.
+
+Run Gmail OAuth setup:
+
+```bash
+python -m gateway.platforms.gmail_actions auth
+```
+
+By default, Hermes reads:
+
+- `~/.hermes/gmail_credentials.json` for the OAuth client JSON
+- `~/.hermes/gmail_token.json` for the saved token
+- `~/.hermes/gmail_contacts.json` for optional name-to-email mappings
+
+Override those paths with `GMAIL_CREDENTIALS_FILE`, `GMAIL_TOKEN_FILE`, and `GMAIL_CONTACTS_FILE`.
+
+If you only need Gmail App Password SMTP/IMAP setup, use:
+
+```bash
+scripts/configure_gmail_email.sh
+```
+
 ---
 
 ## Step 2: Start the Gateway
@@ -118,6 +150,29 @@ Replies are sent via SMTP with proper email threading:
 ### File Attachments
 
 The agent can send file attachments in replies. Include `MEDIA:/path/to/file` in the response and the file is attached to the outgoing email.
+
+### Scheduled Email From Chat
+
+From Telegram or another gateway chat, Hermes can schedule an email and send it later:
+
+```text
+At 2pm GMT today, email person@example.com with text "following up on our conversation last week" and subject "ai implementation"
+```
+
+Quoted `subject`, `body`, or `text` values are treated as exact strings. You do not need to write the word "exact". Hermes stores the job as cron delivery to `email:person@example.com`, so delivery uses the configured email sender. With `EMAIL_SEND_MODE=gmail_api`, this goes through Gmail API.
+
+After a scheduled email is successfully delivered to an external email target, Hermes sends `done` back to the originating chat.
+
+For deterministic slash-command scheduling:
+
+```text
+/cron add "at 2pm GMT today" "Output exactly this text and nothing else:
+Subject: ai implementation
+
+following up on our conversation last week" --deliver email:person@example.com --repeat 1
+```
+
+Supported simple one-shot schedule phrases include `at 2pm GMT today`, `14:05 UTC tomorrow`, durations like `30m`, ISO timestamps, and cron expressions.
 
 ### Skipping Attachments
 
@@ -184,7 +239,12 @@ Email access follows the same pattern as all other Hermes platforms:
 | `EMAIL_SMTP_HOST` | Yes | — | SMTP server host (e.g., `smtp.gmail.com`) |
 | `EMAIL_IMAP_PORT` | No | `993` | IMAP server port |
 | `EMAIL_SMTP_PORT` | No | `587` | SMTP server port |
+| `EMAIL_SEND_MODE` | No | `smtp` | Set to `gmail_api` to send outbound email through Gmail API |
+| `EMAIL_SMTP_TIMEOUT` | No | `15` | Timeout in seconds for SMTP sends |
 | `EMAIL_POLL_INTERVAL` | No | `15` | Seconds between inbox checks |
 | `EMAIL_ALLOWED_USERS` | No | — | Comma-separated allowed sender addresses |
 | `EMAIL_HOME_ADDRESS` | No | — | Default delivery target for cron jobs |
 | `EMAIL_ALLOW_ALL_USERS` | No | `false` | Allow all senders (not recommended) |
+| `GMAIL_CREDENTIALS_FILE` | No | `~/.hermes/gmail_credentials.json` | Gmail OAuth client JSON for Gmail API sending |
+| `GMAIL_TOKEN_FILE` | No | `~/.hermes/gmail_token.json` | Saved Gmail OAuth token |
+| `GMAIL_CONTACTS_FILE` | No | `~/.hermes/gmail_contacts.json` | Optional contact-name mapping for Gmail API sends |

@@ -208,6 +208,73 @@ def _normalize_deliver_param(value: Any) -> Optional[str]:
     return text or None
 
 
+def _coerce_scheduled_email_delivery(
+    *,
+    prompt: Optional[str],
+    deliver: Optional[str],
+    skills: List[str],
+) -> tuple[Optional[str], Optional[str], List[str]]:
+    """Rewrite scheduled email intents into cron delivery emails.
+
+    Gateway agents can accidentally ask the future cron agent to send mail
+    itself, sometimes with the ``email:himalaya`` skill attached.  On this
+    deployment SMTP/IMAP is not reachable, while cron delivery through
+    ``deliver=email:...`` uses the configured Gmail API path.  Keep this narrow:
+    only rewrite clear prompts with a recipient plus exact subject/body text.
+    """
+    normalized_deliver = _normalize_deliver_param(deliver)
+    text = str(prompt or "").strip()
+
+    email = subject = body = ""
+    legacy_match = re.search(
+        r"(?:send|write)\s+an?\s+email\s+to\s+(?P<email>[^\s,;<>]+@[^\s,;<>]+)"
+        r".*?subject\s+(?:line\s+)?(?:exactly\s*)?:\s*(?P<subject>.+?)"
+        r"\s*\n+\s*Body\s*:\s*(?P<body>.+)\s*\Z",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    exact_match = re.search(
+        r"(?:email|send\s+an?\s+email\s+to|send\s+email\s+to)\s+"
+        r"(?P<email>[^\s,;<>]+@[^\s,;<>]+)"
+        r".*?(?:exact\s+)?(?:text|body)\s*:?\s*[\"'“‘](?P<body>.+?)[\"'”’]"
+        r".*?(?:exact\s+)?subject(?:\s+line)?\s*:?\s*[\"'“‘](?P<subject>.+?)[\"'”’]",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not exact_match:
+        exact_match = re.search(
+            r"(?:email|send\s+an?\s+email\s+to|send\s+email\s+to)\s+"
+            r"(?P<email>[^\s,;<>]+@[^\s,;<>]+)"
+            r".*?(?:exact\s+)?subject(?:\s+line)?\s*:?\s*[\"'“‘](?P<subject>.+?)[\"'”’]"
+            r".*?(?:exact\s+)?(?:text|body)\s*:?\s*[\"'“‘](?P<body>.+?)[\"'”’]",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+
+    match = exact_match or legacy_match
+    if match:
+        email = match.group("email").strip().strip("\"'")
+        subject = match.group("subject").strip().strip("\"'")
+        body = match.group("body").strip().strip("\"'")
+
+    if not email or not subject or not body:
+        return prompt, normalized_deliver, skills
+
+    rewritten_prompt = f"Output exactly this text and nothing else:\nSubject: {subject}\n\n{body}"
+    rewritten_skills = [
+        skill
+        for skill in skills
+        if not str(skill).strip().lower().startswith("email:")
+    ]
+    if normalized_deliver and normalized_deliver.lower().startswith("email:"):
+        logger.info("Rewrote scheduled email prompt for existing cron email delivery target %s", normalized_deliver)
+        return rewritten_prompt, normalized_deliver, rewritten_skills
+    if normalized_deliver:
+        return prompt, normalized_deliver, skills
+    logger.info("Rewrote scheduled email prompt to cron email delivery target email:%s", email)
+    return rewritten_prompt, f"email:{email}", rewritten_skills
+
+
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     """Validate a cron job script path at the API boundary.
 
@@ -316,6 +383,11 @@ def cronjob(
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
+            prompt, deliver, canonical_skills = _coerce_scheduled_email_delivery(
+                prompt=prompt,
+                deliver=deliver,
+                skills=canonical_skills,
+            )
             _no_agent = bool(no_agent)
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
@@ -560,6 +632,11 @@ NOTE: The agent's final response is auto-delivered to the target. Put the primar
 user-facing content in the final response. Cron jobs run autonomously with no user
 present — they cannot ask questions or request clarification.
 
+For scheduled email requests, do NOT attach email skills or ask the future cron
+agent to send mail. Instead set deliver='email:recipient@example.com' and make
+the prompt output the exact email content, including a leading Subject: header.
+Example prompt: "Output exactly this text and nothing else:\nSubject: Hello\n\nBody text"
+
 Important safety rule: cron-run sessions should not recursively schedule more cron jobs.""",
     "parameters": {
         "type": "object",
@@ -578,7 +655,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "schedule": {
                 "type": "string",
-                "description": "For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp"
+                "description": "For create/update: '30m', 'every 2h', '0 9 * * *', ISO timestamp, or simple one-shot chat times like 'at 2pm GMT today'"
             },
             "name": {
                 "type": "string",
@@ -590,7 +667,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
+                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. For scheduled email, set 'email:recipient@example.com' and do not attach email skills. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'email:user@example.com', 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
             },
             "skills": {
                 "type": "array",

@@ -517,6 +517,57 @@ class TestDeliverResultWrapping:
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
 
+    def test_email_delivery_uses_raw_content_even_when_wrapping_enabled(self):
+        """Email cron targets should receive email body content, not chat wrappers."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}):
+            job = {
+                "id": "email-job",
+                "name": "send-followup",
+                "deliver": "email:user@test.com",
+            }
+            _deliver_result(job, "Subject: Follow up\n\nCan you send the notes?")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Subject: Follow up\n\nCan you send the notes?"
+        assert "Cronjob Response" not in sent_content
+
+    def test_email_delivery_sends_done_ack_to_origin(self):
+        """Action-style cron jobs should acknowledge the origin after external delivery."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig, Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}):
+            job = {
+                "id": "email-job",
+                "name": "send-followup",
+                "deliver": "email:user@test.com",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Subject: Follow up\n\nCan you send the notes?")
+
+        assert send_mock.call_count == 2
+        email_call, ack_call = send_mock.call_args_list
+        assert email_call.args[2] == "user@test.com"
+        assert email_call.args[3] == "Subject: Follow up\n\nCan you send the notes?"
+        assert ack_call.args[2] == "123"
+        assert ack_call.args[3] == "done"
+
     def test_delivery_extracts_media_tags_before_send(self):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
         from gateway.config import Platform
