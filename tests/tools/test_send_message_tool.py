@@ -144,6 +144,33 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_dated_outgoing_message_logs_followup(self):
+        config, telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session", return_value=False), \
+             patch("tools.personal_followups_tool.personal_followups_tool", return_value=json.dumps({"success": True, "item_id": "F-9"})) as followup_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-1001",
+                        "message": "ok I'll ping on Friday",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["followup_logged"] == "F-9"
+        followup_mock.assert_called_once()
+        followup_args = followup_mock.call_args.args[0]
+        assert followup_args["action"] == "log"
+        assert followup_args["raw_text"] == "ok I'll ping on Friday"
+        assert followup_args["require_due"] is True
+
     def test_whatsapp_jid_is_explicit_target(self):
         chat_id, thread_id, is_explicit = _parse_target_ref(
             "whatsapp",

@@ -334,6 +334,26 @@ def _handle_send(args):
             except Exception:
                 pass
 
+        if isinstance(result, dict) and result.get("success") and mirror_text:
+            try:
+                from tools.personal_followups_tool import personal_followups_tool
+
+                followup_result = json.loads(
+                    personal_followups_tool(
+                        {
+                            "action": "log",
+                            "source": platform_name if platform_name in {"email", "whatsapp", "telegram"} else "manual",
+                            "contact": target_ref or chat_id or platform_name,
+                            "raw_text": mirror_text,
+                            "require_due": True,
+                        }
+                    )
+                )
+                if followup_result.get("success"):
+                    result["followup_logged"] = followup_result.get("item_id")
+            except Exception:
+                pass
+
         if isinstance(result, dict) and "error" in result:
             result["error"] = _sanitize_error_text(result["error"])
         return json.dumps(result)

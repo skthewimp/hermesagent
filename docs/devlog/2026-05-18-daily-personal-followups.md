@@ -163,9 +163,35 @@ Tool actions:
 
 - `digest`: scan, persist, extract, dedupe, and render the daily summary.
 - `feedback`: apply natural-language state changes to an item.
+- `log`: immediately record an explicit follow-up from a message the agent understands.
 - `list`: inspect current items.
 - `status`: inspect database path and counts.
 - `reset`: delete the local follow-up database.
+
+## Dated Commitments
+
+Some messages are not todos for today. For example:
+
+```text
+ok I'll ping on Friday
+```
+
+The tool now parses common due-date phrases and stores those items immediately with `status="snoozed"` until the appropriate date. Supported deterministic date forms include:
+
+- `today`, `tonight`, `later today`
+- `tomorrow`
+- weekdays such as `Friday`
+- `next week`
+- ISO dates like `2026-05-22`
+- simple month dates like `22 May` or `May 22`
+
+This is intentionally a hybrid boundary:
+
+- deterministic code owns calendar math and state transitions
+- the LLM/agent owns ambiguous intent detection and can call `action="log"` immediately when it understands a dated promise
+- the daily scanner remains a backstop for common Gmail/WhatsApp patterns
+
+`send_message` also calls `personal_followups(action="log", require_due=true)` after a successful outbound send. That means messages sent through Hermes such as `ok I'll ping on Friday` are logged immediately when the date phrase is recognizable, without relying on the model to remember a second tool call.
 
 ## Validation
 
@@ -189,6 +215,9 @@ Coverage:
 - repeated digest dedupes existing items
 - item-level dismiss feedback removes active item
 - explicit-id snooze feedback updates the selected item
+- outgoing dated commitments are snoozed until their due date
+- `log` records an immediate dated follow-up
+- `send_message` auto-logs recognizable dated outbound follow-ups
 - existing inbound catch-up behavior still passes
 
 ## Next Steps

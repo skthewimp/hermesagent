@@ -39,8 +39,8 @@ PERSONAL_FOLLOWUPS_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["digest", "feedback", "list", "status", "reset"],
-                "description": "digest scans recent sources and returns today's todo digest. feedback applies user feedback. list/status inspect state. reset clears stored follow-up state.",
+                "enum": ["digest", "feedback", "log", "list", "status", "reset"],
+                "description": "digest scans recent sources and returns today's todo digest. feedback applies user feedback. log records an explicit follow-up from a message. list/status inspect state. reset clears stored follow-up state.",
             },
             "lookback_days": {
                 "type": "integer",
@@ -52,7 +52,16 @@ PERSONAL_FOLLOWUPS_SCHEMA = {
             },
             "raw_text": {
                 "type": "string",
-                "description": "Natural-language feedback text for action='feedback'.",
+                "description": "Natural-language feedback text for action='feedback', or message text for action='log'.",
+            },
+            "contact": {
+                "type": "string",
+                "description": "Optional contact/chat/person for action='log'.",
+            },
+            "source": {
+                "type": "string",
+                "enum": ["manual", "email", "whatsapp", "telegram"],
+                "description": "Optional source label for action='log'. Default manual.",
             },
             "item_id": {
                 "type": "string",
@@ -66,6 +75,10 @@ PERSONAL_FOLLOWUPS_SCHEMA = {
             "dry_run": {
                 "type": "boolean",
                 "description": "For action='digest', scan and render without persisting newly extracted items.",
+            },
+            "require_due": {
+                "type": "boolean",
+                "description": "For action='log', only create an item if raw_text contains a recognizable due date. Default false.",
             },
         },
         "required": [],
@@ -171,6 +184,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
             metadata_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_attention_status ON attention_items(status, suppress_until);
+        CREATE INDEX IF NOT EXISTS idx_attention_due ON attention_items(suppress_until);
         CREATE TABLE IF NOT EXISTS item_messages (
             item_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
@@ -458,7 +472,9 @@ _INCOMING_ACTION_RE = re.compile(
 )
 _OUTGOING_COMMIT_RE = re.compile(
     r"\b(i will|i'll|i can|i should|let me|will send|will share|will check|"
-    r"get back|circle back|follow up|tomorrow|tonight|later today|next week)\b",
+    r"ping|will ping|message|will message|get back|circle back|follow up|"
+    r"tomorrow|tonight|later today|next week|monday|tuesday|wednesday|thursday|"
+    r"friday|saturday|sunday)\b",
     re.IGNORECASE,
 )
 _OUTGOING_WAITING_RE = re.compile(
@@ -466,6 +482,117 @@ _OUTGOING_WAITING_RE = re.compile(
     r"thoughts|wdyt)\b|\?",
     re.IGNORECASE,
 )
+
+_WEEKDAYS = {
+    "monday": 0,
+    "mon": 0,
+    "tuesday": 1,
+    "tue": 1,
+    "tues": 1,
+    "wednesday": 2,
+    "wed": 2,
+    "thursday": 3,
+    "thu": 3,
+    "thur": 3,
+    "thurs": 3,
+    "friday": 4,
+    "fri": 4,
+    "saturday": 5,
+    "sat": 5,
+    "sunday": 6,
+    "sun": 6,
+}
+
+_MONTHS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+
+def _start_of_day_utc(dt: datetime) -> datetime:
+    return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _next_weekday(base: datetime, weekday: int, *, force_next_week: bool = False) -> datetime:
+    base_day = _start_of_day_utc(base)
+    days = (weekday - base_day.weekday()) % 7
+    if days == 0 or force_next_week:
+        days += 7
+    return base_day + timedelta(days=days)
+
+
+def _parse_followup_due(text: str, base: datetime) -> datetime | None:
+    lowered = f" {text.lower()} "
+    if re.search(r"\b(later today|tonight|today)\b", lowered):
+        return _start_of_day_utc(base)
+    if re.search(r"\btomorrow\b", lowered):
+        return _start_of_day_utc(base) + timedelta(days=1)
+    if re.search(r"\bnext week\b", lowered):
+        return _start_of_day_utc(base) + timedelta(days=7)
+
+    iso_match = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", lowered)
+    if iso_match:
+        try:
+            return datetime(
+                int(iso_match.group(1)),
+                int(iso_match.group(2)),
+                int(iso_match.group(3)),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            pass
+
+    month_pattern = "|".join(sorted(_MONTHS, key=len, reverse=True))
+    date_month = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})\b", lowered)
+    month_date = re.search(rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", lowered)
+    if date_month or month_date:
+        if date_month:
+            day = int(date_month.group(1))
+            month = _MONTHS[date_month.group(2)]
+        else:
+            month = _MONTHS[month_date.group(1)]
+            day = int(month_date.group(2))
+        year = base.year
+        try:
+            due = datetime(year, month, day, tzinfo=timezone.utc)
+            if due.date() < base.date():
+                due = datetime(year + 1, month, day, tzinfo=timezone.utc)
+            return due
+        except ValueError:
+            pass
+
+    weekday_match = re.search(
+        r"\b(?P<next>next\s+)?(?P<weekday>mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|"
+        r"thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b",
+        lowered,
+    )
+    if weekday_match:
+        weekday = _WEEKDAYS[weekday_match.group("weekday")]
+        return _next_weekday(base, weekday, force_next_week=bool(weekday_match.group("next")))
+
+    return None
 
 
 def _upsert_source_message(conn: sqlite3.Connection, row: dict[str, Any], now: datetime) -> int:
@@ -519,13 +646,24 @@ def _candidate_from_message(row: sqlite3.Row) -> dict[str, Any] | None:
     reason = ""
     action = ""
     priority = 2
+    suppress_until = None
+    suppression_reason = None
+    message_at = _parse_dt(row["message_at"]) or _now_utc()
     if direction == "incoming" and _INCOMING_ACTION_RE.search(searchable):
         reason = "Looks like they asked for a response or action."
         action = "Reply or decide no reply is needed."
         priority = 1 if "?" in searchable else 2
     elif direction == "outgoing" and _OUTGOING_COMMIT_RE.search(searchable):
-        reason = "Looks like you committed to follow up."
-        action = "Follow through or mark it done."
+        due = _parse_followup_due(searchable, message_at)
+        if due and due > _start_of_day_utc(_now_utc()):
+            status = "snoozed"
+            suppress_until = _format_dt(due)
+            suppression_reason = "dated follow-up commitment"
+            reason = f"Looks like you committed to follow up on {due.date().isoformat()}."
+            action = f"Follow up on {due.date().isoformat()}."
+        else:
+            reason = "Looks like you committed to follow up."
+            action = "Follow through or mark it done."
         priority = 1
     elif direction == "outgoing" and _OUTGOING_WAITING_RE.search(searchable):
         status = "waiting"
@@ -551,7 +689,13 @@ def _candidate_from_message(row: sqlite3.Row) -> dict[str, Any] | None:
         "priority": priority,
         "reason": reason,
         "evidence": evidence,
-        "metadata": {"direction": direction, "message_at": row["message_at"]},
+        "suppress_until": suppress_until,
+        "suppression_reason": suppression_reason,
+        "metadata": {
+            "direction": direction,
+            "message_at": row["message_at"],
+            "due_at": suppress_until,
+        },
     }
 
 
@@ -574,7 +718,8 @@ def _upsert_attention_item(
                 """
                 UPDATE attention_items
                 SET title = ?, suggested_action = ?, contact = ?, priority = ?,
-                    reason = ?, evidence = ?, last_seen_at = ?, metadata_json = ?
+                    reason = ?, evidence = ?, status = ?, suppress_until = ?,
+                    suppression_reason = ?, last_seen_at = ?, metadata_json = ?
                 WHERE id = ?
                 """,
                 (
@@ -584,6 +729,9 @@ def _upsert_attention_item(
                     candidate["priority"],
                     candidate["reason"],
                     candidate["evidence"],
+                    candidate["status"],
+                    candidate.get("suppress_until"),
+                    candidate.get("suppression_reason"),
                     now_text,
                     json.dumps(candidate.get("metadata") or {}, ensure_ascii=False),
                     int(existing["id"]),
@@ -596,9 +744,9 @@ def _upsert_attention_item(
             INSERT INTO attention_items(
                 fingerprint, title, suggested_action, source, thread_key, contact,
                 status, priority, reason, evidence, first_seen_at, last_seen_at,
-                metadata_json
+                suppress_until, suppression_reason, metadata_json
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 candidate["fingerprint"],
@@ -613,6 +761,8 @@ def _upsert_attention_item(
                 candidate["evidence"],
                 now_text,
                 now_text,
+                candidate.get("suppress_until"),
+                candidate.get("suppression_reason"),
                 json.dumps(candidate.get("metadata") or {}, ensure_ascii=False),
             ),
         )
@@ -640,6 +790,78 @@ def _scan_sources(conn: sqlite3.Connection, since: datetime, until: datetime, li
         counts["items_created_or_updated"] += 1
     conn.commit()
     return counts
+
+
+def _log_followup(conn: sqlite3.Connection, args: dict[str, Any]) -> str:
+    raw_text = str(args.get("raw_text") or "").strip()
+    if not raw_text:
+        return tool_error("raw_text is required for action='log'")
+
+    now = _now_utc()
+    contact = str(args.get("contact") or "Manual follow-up").strip()
+    source = str(args.get("source") or "manual").strip().lower()
+    if source not in {"manual", "email", "whatsapp", "telegram"}:
+        source = "manual"
+    due = _parse_followup_due(raw_text, now)
+    if bool(args.get("require_due")) and due is None:
+        return json.dumps(
+            {
+                "success": False,
+                "skipped": True,
+                "reason": "no recognizable due date",
+            },
+            ensure_ascii=False,
+        )
+    status = "snoozed" if due and due > _start_of_day_utc(now) else "active"
+    suppress_until = _format_dt(due) if status == "snoozed" and due else None
+    source_id = _hash_key("manual-log", source, contact, raw_text, _format_dt(now))
+    thread_key = _hash_key("manual-thread", source, contact)
+    source_row = {
+        "source": source,
+        "source_id": source_id,
+        "thread_key": thread_key,
+        "contact": contact,
+        "contact_ref": contact,
+        "direction": "outgoing",
+        "message_at": _format_dt(now),
+        "subject": "",
+        "body": raw_text,
+        "metadata": {"manual_log": True},
+    }
+    message_id = _upsert_source_message(conn, source_row, now)
+    if due:
+        action = f"Follow up on {due.date().isoformat()}."
+        reason = f"Manually logged dated follow-up for {due.date().isoformat()}."
+    else:
+        action = "Follow through or mark it done."
+        reason = "Manually logged follow-up."
+    candidate = {
+        "fingerprint": _hash_key("manual-item", source, thread_key, raw_text.lower()),
+        "title": f"{contact} via {source}",
+        "suggested_action": action,
+        "source": source,
+        "thread_key": thread_key,
+        "contact": contact,
+        "status": status,
+        "priority": 1,
+        "reason": reason,
+        "evidence": _snippet(raw_text, 220),
+        "suppress_until": suppress_until,
+        "suppression_reason": "dated follow-up commitment" if suppress_until else None,
+        "metadata": {"direction": "outgoing", "message_at": _format_dt(now), "due_at": suppress_until, "manual_log": True},
+    }
+    item_id = _upsert_attention_item(conn, candidate, message_id, now)
+    conn.commit()
+    return json.dumps(
+        {
+            "success": True,
+            "item_id": _public_id(item_id),
+            "status": status,
+            "suppress_until": suppress_until,
+            "summary": f"{_public_id(item_id)} logged for {contact}.",
+        },
+        ensure_ascii=False,
+    )
 
 
 def _visible_items(conn: sqlite3.Connection, now: datetime, status_filter: str = "active") -> list[sqlite3.Row]:
@@ -858,6 +1080,8 @@ def personal_followups_tool(args, **kw):
             return _list_items(conn, status_filter)
         if action == "feedback":
             return _apply_feedback(conn, args)
+        if action == "log":
+            return _log_followup(conn, args)
         if action != "digest":
             return tool_error(f"Unknown personal_followups action: {action}")
 

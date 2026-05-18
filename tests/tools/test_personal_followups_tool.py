@@ -153,3 +153,61 @@ def test_feedback_snoozes_item_with_explicit_id(tmp_path, monkeypatch):
     assert result["action"] == "snoozed"
     snoozed = json.loads(pft.personal_followups_tool({"action": "list", "status_filter": "snoozed"}))
     assert snoozed["items"][0]["id"] == target
+
+
+def test_outgoing_dated_commitment_is_snoozed_until_due_date(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)  # Monday
+    monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
+    monkeypatch.setattr(pft, "_fetch_whatsapp_messages", lambda since, until, limit: [])
+    monkeypatch.setattr(
+        pft,
+        "_fetch_email_messages",
+        lambda since, until, limit: [
+            {
+                "source": "email",
+                "source_id": "email-friday",
+                "thread_key": "thread-friday",
+                "contact": "Ravi",
+                "contact_ref": "ravi@example.com",
+                "direction": "outgoing",
+                "message_at": "2026-05-18T03:00:00Z",
+                "subject": "Follow up",
+                "body": "Ok I'll ping on Friday.",
+                "metadata": {},
+            }
+        ],
+    )
+
+    digest = json.loads(pft.personal_followups_tool({"action": "digest"}))
+    active = json.loads(pft.personal_followups_tool({"action": "list"}))
+    snoozed = json.loads(pft.personal_followups_tool({"action": "list", "status_filter": "snoozed"}))
+
+    assert "No reply/follow-up todos" in digest["summary"]
+    assert active["items"] == []
+    assert len(snoozed["items"]) == 1
+    assert snoozed["items"][0]["suppress_until"] == "2026-05-22T00:00:00Z"
+    assert snoozed["items"][0]["suggested_action"] == "Follow up on 2026-05-22."
+
+
+def test_log_action_records_dated_followup_immediately(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)  # Monday
+    monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
+
+    result = json.loads(
+        pft.personal_followups_tool(
+            {
+                "action": "log",
+                "source": "telegram",
+                "contact": "Asha",
+                "raw_text": "ok I'll ping on Friday",
+            }
+        )
+    )
+    snoozed = json.loads(pft.personal_followups_tool({"action": "list", "status_filter": "snoozed"}))
+
+    assert result["success"] is True
+    assert result["status"] == "snoozed"
+    assert result["suppress_until"] == "2026-05-22T00:00:00Z"
+    assert snoozed["items"][0]["contact"] == "Asha"
