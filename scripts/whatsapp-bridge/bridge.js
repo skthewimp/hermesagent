@@ -130,6 +130,23 @@ function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
+function contactName(contact) {
+  return String(
+    contact?.name ||
+    contact?.notify ||
+    contact?.verifiedName ||
+    contact?.pushName ||
+    ''
+  ).trim();
+}
+
+function normalizeContactQuery(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
 function isLidJid(value) {
   return /@(?:hosted\.)?lid$/.test(String(value || ''));
 }
@@ -159,6 +176,88 @@ function rememberLidPhoneMapping(first, second) {
   }
 
   return stored;
+}
+
+function rememberContact(raw) {
+  if (!raw || typeof raw !== 'object') return;
+  const id = normalizeWhatsAppId(raw.id || raw.jid || raw.chatId || raw.phoneNumber || raw.lid);
+  const lid = normalizeWhatsAppId(raw.lid);
+  const phoneNumber = normalizeWhatsAppId(raw.phoneNumber || raw.pn);
+  const name = contactName(raw);
+
+  for (const candidateId of [id, lid, phoneNumber].filter(Boolean)) {
+    const existing = contactsById.get(candidateId) || {};
+    contactsById.set(candidateId, {
+      ...existing,
+      id: candidateId,
+      name: name || existing.name || '',
+      notify: raw.notify || existing.notify || '',
+      verifiedName: raw.verifiedName || existing.verifiedName || '',
+      lid: lid || existing.lid || '',
+      phoneNumber: phoneNumber || existing.phoneNumber || '',
+    });
+  }
+
+  rememberLidPhoneMapping(lid, phoneNumber);
+}
+
+function rememberMessageContact({ chatId, senderId, senderName, chatName, isGroup }) {
+  if (!isGroup && chatId) {
+    rememberContact({ id: chatId, name: chatName || senderName });
+  }
+  if (senderId) {
+    rememberContact({ id: senderId, name: senderName });
+  }
+}
+
+function contactRows() {
+  return Array.from(contactsById.values())
+    .filter((contact) => contact.id && contact.name)
+    .map((contact) => ({
+      id: contact.id,
+      name: contact.name,
+      notify: contact.notify || undefined,
+      verifiedName: contact.verifiedName || undefined,
+      lid: contact.lid || undefined,
+      phoneNumber: contact.phoneNumber || undefined,
+    }));
+}
+
+function resolveContact(query, limit = 10) {
+  const needle = normalizeContactQuery(query);
+  if (!needle) return [];
+
+  const scored = [];
+  for (const contact of contactRows()) {
+    const names = [
+      contact.name,
+      contact.notify,
+      contact.verifiedName,
+      contact.id,
+      contact.phoneNumber,
+      contact.lid,
+    ].filter(Boolean);
+    let best = 0;
+    for (const name of names) {
+      const normalized = normalizeContactQuery(name);
+      if (!normalized) continue;
+      if (normalized === needle) best = Math.max(best, 100);
+      else if (normalized.startsWith(needle)) best = Math.max(best, 80);
+      else if (normalized.includes(needle)) best = Math.max(best, 60);
+    }
+    if (best > 0) scored.push({ score: best, contact });
+  }
+
+  scored.sort((a, b) => b.score - a.score || a.contact.name.localeCompare(b.contact.name));
+  const deduped = [];
+  const seen = new Set();
+  for (const item of scored) {
+    const key = item.contact.phoneNumber || item.contact.lid || item.contact.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+  return deduped.slice(0, limit).map(({ score, contact }) => ({ ...contact, score }));
 }
 
 function getMessageContent(msg) {
@@ -207,6 +306,7 @@ const logger = pino({ level: 'warn' });
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
 const observedMessages = [];
+const contactsById = new Map();
 
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
@@ -242,9 +342,24 @@ async function startSocket() {
     rememberLidPhoneMapping(lid, pn);
   });
 
-  sock.ev.on('messaging-history.set', ({ lidPnMappings = [] }) => {
+  sock.ev.on('messaging-history.set', ({ contacts = [], lidPnMappings = [] }) => {
+    for (const contact of contacts) {
+      rememberContact(contact);
+    }
     for (const { lid, pn } of lidPnMappings) {
       rememberLidPhoneMapping(lid, pn);
+    }
+  });
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const contact of contacts || []) {
+      rememberContact(contact);
+    }
+  });
+
+  sock.ev.on('contacts.update', (contacts) => {
+    for (const contact of contacts || []) {
+      rememberContact(contact);
     }
   });
 
@@ -496,6 +611,8 @@ async function startSocket() {
         timestamp: msg.messageTimestamp,
       };
 
+      rememberMessageContact(event);
+
       observedMessages.push({
         observedAt: new Date().toISOString(),
         upsertType: type,
@@ -584,6 +701,33 @@ app.get('/observed', (req, res) => {
   }
 
   res.json(rows.slice(-limit));
+});
+
+// In-memory contact lookup from WhatsApp sync/contact/message events.
+app.get('/contacts', (req, res) => {
+  const query = String(req.query.query || '').trim();
+  const limitRaw = parseInt(String(req.query.limit || '25'), 10);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 100)) : 25;
+  const rows = query ? resolveContact(query, limit) : contactRows().slice(0, limit);
+  res.json(rows);
+});
+
+app.get('/resolve-contact', (req, res) => {
+  const query = String(req.query.query || '').trim();
+  const matches = resolveContact(query, 10);
+  const bestScore = matches[0]?.score || 0;
+  const best = matches.filter((match) => match.score === bestScore);
+
+  if (!query) {
+    return res.status(400).json({ error: 'query is required' });
+  }
+  if (best.length === 1 && bestScore >= 80) {
+    return res.json({ success: true, contact: best[0], matches });
+  }
+  if (matches.length > 0) {
+    return res.status(409).json({ error: 'ambiguous_contact', matches });
+  }
+  return res.status(404).json({ error: 'contact_not_found', matches: [] });
 });
 
 // Send a message

@@ -714,7 +714,7 @@ Example prompt: "Output exactly this text and nothing else:\nSubject: Hello\n\nB
 For scheduled WhatsApp requests, do NOT ask the future cron agent to call
 send_message. Instead set deliver='whatsapp:contact-name-or-phone' and make
 the prompt output exactly the message text. WhatsApp contact names are resolved
-from the channel directory and `~/.hermes/whatsapp_contacts.json`.
+from the live WhatsApp bridge when available, then the channel directory.
 
 Important safety rule: cron-run sessions should not recursively schedule more cron jobs.""",
     "parameters": {

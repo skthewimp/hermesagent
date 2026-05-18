@@ -27,8 +27,8 @@ WHATSAPP_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["recent", "search", "chats"],
-                "description": "recent: return recent observed messages. search: keyword search. chats: list observed WhatsApp chats.",
+                "enum": ["recent", "search", "chats", "contacts"],
+                "description": "recent: return recent observed messages. search: keyword search. chats: list observed WhatsApp chats. contacts: search live WhatsApp contacts known to the bridge.",
             },
             "chat": {
                 "type": "string",
@@ -130,6 +130,21 @@ def _fetch_observed_messages(args: dict[str, Any], limit: int) -> list[dict[str,
     return [row for row in data if isinstance(row, dict)]
 
 
+def _fetch_live_contacts(query: str, limit: int) -> list[dict[str, Any]]:
+    params: dict[str, str] = {"limit": str(max(1, min(limit, 100)))}
+    if query:
+        params["query"] = query
+    url = f"http://127.0.0.1:{_bridge_port()}/contacts?{urlencode(params)}"
+    try:
+        with urlopen(url, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [row for row in data if isinstance(row, dict)]
+
+
 def _display_name(record: dict[str, Any], contacts: dict[str, str]) -> str:
     for key in ("chatId", "senderId"):
         label = contacts.get(_normalize_ref(record.get(key)))
@@ -187,6 +202,16 @@ def whatsapp_tool(args, **kw):
     chat = str(args.get("chat") or "").strip()
     direction = str(args.get("direction") or "all").lower()
     contacts = _contact_map()
+
+    if action == "contacts":
+        query = str(args.get("query") or chat).strip()
+        return json.dumps(
+            {
+                "storage": "in_memory_only",
+                "contacts": _fetch_live_contacts(query, limit),
+            },
+            ensure_ascii=False,
+        )
 
     fetch_limit = max(limit * 10, 200) if action == "chats" else limit
     messages = _fetch_observed_messages(

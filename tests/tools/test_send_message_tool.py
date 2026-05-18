@@ -24,6 +24,7 @@ from gateway.config import Platform
 from tools.send_message_tool import (
     _derive_forum_thread_name,
     _parse_target_ref,
+    _resolve_whatsapp_live_contact,
     _send_discord,
     _send_matrix_via_adapter,
     _send_signal,
@@ -152,6 +153,31 @@ class TestSendMessageTool:
         assert chat_id == "15551234567@s.whatsapp.net"
         assert thread_id is None
         assert is_explicit is True
+
+    def test_whatsapp_live_contact_resolves_name(self, monkeypatch):
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "success": True,
+                        "contact": {
+                            "id": "15551234567@s.whatsapp.net",
+                            "name": "Alex",
+                        },
+                    }
+                ).encode()
+
+        monkeypatch.setattr("tools.send_message_tool.urlopen", lambda *args, **kwargs: FakeResponse())
+
+        assert _resolve_whatsapp_live_contact("Alex") == "15551234567@s.whatsapp.net"
 
     def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
         config, telegram_cfg = _make_config()

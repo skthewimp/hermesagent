@@ -14,6 +14,9 @@ import ssl
 import time
 from email.utils import formatdate
 from typing import Dict, Optional
+from urllib.parse import urlencode
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 from agent.redact import redact_sensitive_text
 
@@ -199,16 +202,24 @@ def _handle_send(args):
 
     # Resolve human-friendly channel names to numeric IDs
     if target_ref and not is_explicit:
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_name, target_ref)
+        if platform_name == "whatsapp":
+            resolved = _resolve_whatsapp_live_contact(target_ref)
+            if isinstance(resolved, dict) and resolved.get("error"):
+                return json.dumps(resolved)
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
-            else:
-                return json.dumps({
-                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                    f"Use send_message(action='list') to see available targets."
-                })
+                is_explicit = True
+        try:
+            if not chat_id:
+                from gateway.channel_directory import resolve_channel_name
+                resolved = resolve_channel_name(platform_name, target_ref)
+                if resolved:
+                    chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                else:
+                    return json.dumps({
+                        "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                        f"Use send_message(action='list') to see available targets."
+                    })
         except Exception:
             return json.dumps({
                 "error": f"Could not resolve '{target_ref}' on {platform_name}. "
@@ -328,6 +339,42 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+def _resolve_whatsapp_live_contact(target_ref: str):
+    """Resolve a human WhatsApp contact name against the live bridge."""
+    bridge_port = int(os.getenv("WHATSAPP_BRIDGE_PORT", "3000"))
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        pconfig = load_gateway_config().platforms.get(Platform.WHATSAPP)
+        if pconfig:
+            bridge_port = int(pconfig.extra.get("bridge_port", bridge_port))
+    except Exception:
+        pass
+    url = f"http://127.0.0.1:{bridge_port}/resolve-contact?{urlencode({'query': target_ref})}"
+    try:
+        with urlopen(url, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            data = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    if not data.get("success"):
+        matches = data.get("matches") or []
+        if matches:
+            names = ", ".join(
+                f"{match.get('name') or match.get('id')} ({match.get('id')})"
+                for match in matches[:5]
+            )
+            return {"error": f"WhatsApp contact '{target_ref}' is ambiguous. Matches: {names}"}
+        return None
+    contact = data.get("contact") or {}
+    return contact.get("id") or contact.get("phoneNumber") or contact.get("lid")
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):
