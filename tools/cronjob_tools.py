@@ -734,7 +734,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "schedule": {
                 "type": "string",
-                "description": "For create/update: '30m', 'every 2h', '0 9 * * *', ISO timestamp, or simple one-shot chat times like 'at 2pm GMT today'"
+                "description": "For create/update: '30m', 'every 2h', '0 9 * * *', ISO timestamp, or simple one-shot chat times like 'at 2pm today'. If the user gives a wall-clock time without a timezone, preserve it as a human schedule in the user's configured Hermes timezone; do not convert it to UTC yourself. Include an explicit timezone only when the user stated one."
             },
             "name": {
                 "type": "string",

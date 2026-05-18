@@ -6246,7 +6246,7 @@ class AIAgent:
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p %Z')}".strip()
         if self.pass_session_id and self.session_id:
             timestamp_line += f"\nSession ID: {self.session_id}"
         if self.model:
