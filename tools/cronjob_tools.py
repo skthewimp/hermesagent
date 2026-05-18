@@ -312,6 +312,45 @@ def _is_whatsapp_target_known(target: str) -> bool:
         return False
 
 
+def _looks_like_literal_delivery_text(text: str) -> bool:
+    """Best-effort guard for scheduled direct-message bodies.
+
+    If the model already selected a concrete delivery target, a short plain
+    prompt is usually the message body, not a research/report instruction.
+    Keep this conservative so report-style cron jobs can still use WhatsApp
+    as their destination.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.lower().startswith("output exactly this text"):
+        return False
+    if len(stripped) > 500:
+        return False
+    command_prefixes = (
+        "check ",
+        "summarize ",
+        "summary ",
+        "report ",
+        "monitor ",
+        "watch ",
+        "search ",
+        "find ",
+        "research ",
+        "query ",
+        "run ",
+        "execute ",
+        "look up ",
+        "list ",
+        "draft ",
+        "write ",
+        "create ",
+        "generate ",
+        "use ",
+    )
+    return not stripped.lower().startswith(command_prefixes)
+
+
 def _coerce_scheduled_whatsapp_delivery(
     *,
     prompt: Optional[str],
@@ -324,6 +363,9 @@ def _coerce_scheduled_whatsapp_delivery(
     explicit_whatsapp = re.search(r"\b(?:whatsapp|wa)\b", text, re.IGNORECASE)
     target, body = _extract_scheduled_whatsapp_message(text)
     if not target or not body:
+        if normalized_deliver and normalized_deliver.lower().startswith("whatsapp:") and _looks_like_literal_delivery_text(text):
+            rewritten_prompt = f"Output exactly this text and nothing else:\n{text}"
+            return rewritten_prompt, normalized_deliver, skills
         return prompt, normalized_deliver, skills
 
     if normalized_deliver:

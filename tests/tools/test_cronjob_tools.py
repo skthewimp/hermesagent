@@ -460,6 +460,43 @@ class TestUnifiedCronjobTool:
         assert stored["deliver"] == "whatsapp:15551234567@s.whatsapp.net"
         assert stored["prompt"] == "Output exactly this text and nothing else:\nhey"
 
+    def test_create_wraps_literal_body_with_existing_whatsapp_delivery(self):
+        from cron.jobs import get_job
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="trying to build some cool whatsapp tools on hermes",
+                schedule="at 9am ET today",
+                deliver="whatsapp:15551234567@s.whatsapp.net",
+            )
+        )
+
+        assert result["success"] is True
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "whatsapp:15551234567@s.whatsapp.net"
+        assert stored["prompt"] == (
+            "Output exactly this text and nothing else:\n"
+            "trying to build some cool whatsapp tools on hermes"
+        )
+
+    def test_create_does_not_wrap_report_prompt_with_existing_whatsapp_delivery(self):
+        from cron.jobs import get_job
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="summarize HN and report the top AI stories",
+                schedule="at 9am ET today",
+                deliver="whatsapp:15551234567@s.whatsapp.net",
+            )
+        )
+
+        assert result["success"] is True
+        stored = get_job(result["job_id"])
+        assert stored["deliver"] == "whatsapp:15551234567@s.whatsapp.net"
+        assert stored["prompt"] == "summarize HN and report the top AI stories"
+
     def test_multi_skill_default_name_prefers_prompt_when_present(self):
         result = json.loads(
             cronjob(
