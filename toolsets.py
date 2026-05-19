@@ -364,6 +364,8 @@ TOOLSETS = {
             "terminal", "process",
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
+            # Host-side GitHub access via authenticated gh CLI
+            "github",
             # Vision + image generation
             "vision_analyze", "image_generate",
             # Skills
