@@ -206,8 +206,10 @@ function rememberContact(raw, { persist = true } = {}) {
     });
   }
 
-  rememberLidPhoneMapping(lid, phoneNumber);
-  if (persist) scheduleContactCacheSave();
+  if (persist) {
+    rememberLidPhoneMapping(lid, phoneNumber);
+    scheduleContactCacheSave();
+  }
 }
 
 function rememberMessageContact({ chatId, senderId, senderName, chatName, isGroup }) {
