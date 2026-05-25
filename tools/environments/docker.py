@@ -586,6 +586,37 @@ class DockerEnvironment(BaseEnvironment):
 
         return _popen_bash(cmd, stdin_data)
 
+    def _kill_process(self, proc):
+        """Terminate a docker exec command and its in-container process tree."""
+        if self._container_id:
+            cleanup_script = r"""
+self=$$
+for sig in TERM KILL; do
+  for procdir in /proc/[0-9]*; do
+    pid=${procdir##*/}
+    [ "$pid" = "1" ] && continue
+    [ "$pid" = "$self" ] && continue
+    kill -$sig "$pid" 2>/dev/null || true
+  done
+  [ "$sig" = "TERM" ] && sleep 1
+done
+"""
+            try:
+                subprocess.run(
+                    [self._docker_exe, "exec", self._container_id, "sh", "-c", cleanup_script],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Failed to clean docker exec process tree in %s: %s",
+                    self._container_id,
+                    e,
+                )
+
+        super()._kill_process(proc)
+
     @staticmethod
     def _storage_opt_supported() -> bool:
         """Check if Docker's storage driver supports --storage-opt size=.
