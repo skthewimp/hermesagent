@@ -4244,7 +4244,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
 
-    async def _handle_phase1_voice_message(self, msg: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _handle_voice_message(self, msg: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Transcribe a voice note and forward it to the normal message path."""
         file_id = getattr(getattr(msg, "voice", None), "file_id", None)
         tmp_path: Optional[str] = None
@@ -4261,6 +4261,9 @@ class TelegramAdapter(BasePlatformAdapter):
             tmp_path = await downloadTelegramVoice(context, file_id)
             transcript = await asyncio.to_thread(transcribeAudio, tmp_path)
             logger.info("[Telegram] Voice transcription complete (%d chars)", len(transcript))
+
+            if transcript:
+                await msg.reply_text(transcript)
 
             event = self._build_message_event(msg, MessageType.VOICE)
             event.text = transcript
@@ -4293,7 +4296,7 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = update.message
 
         if msg.voice:
-            await self._handle_phase1_voice_message(msg, context)
+            await self._handle_voice_message(msg, context)
             return
         
         # Determine media type
