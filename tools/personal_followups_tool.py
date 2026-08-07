@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import email as email_lib
+import base64
 import hashlib
 import imaplib
 import json
@@ -14,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import hermes_time
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -23,8 +24,10 @@ from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 DEFAULT_LOOKBACK_DAYS = 7
+DIGEST_MAX_AGE_DAYS = 30
+WAITING_MIN_AGE_DAYS = 3
 
 
 PERSONAL_FOLLOWUPS_SCHEMA = {
@@ -202,6 +205,26 @@ def _init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    version_row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    try:
+        previous_version = int(version_row["value"]) if version_row else 0
+    except (TypeError, ValueError):
+        previous_version = 0
+
+    if previous_version and previous_version < 2:
+        # Version 1 used Message-ID / In-Reply-To as email thread keys.  That
+        # split sent replies away from inbound requests, so its open email
+        # candidates cannot be reconciled safely.  Close them once and rebuild
+        # the recent window using the stable v2 key.
+        conn.execute(
+            """
+            UPDATE attention_items
+            SET status = 'done', suppression_reason = 'rebuilt after email thread-key upgrade',
+                suppress_until = NULL
+            WHERE source = 'email' AND status IN ('active', 'waiting', 'snoozed')
+            """
+        )
+
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (str(STATE_VERSION),),
@@ -246,20 +269,73 @@ def _bridge_port() -> int:
     return int(os.getenv("WHATSAPP_BRIDGE_PORT", "3000"))
 
 
+def _whatsapp_observed_cache_path() -> Path:
+    return Path(
+        os.getenv("WHATSAPP_OBSERVED_CACHE_FILE")
+        or (get_hermes_home() / "whatsapp" / "observed_messages.json")
+    )
+
+
+def _whatsapp_contact_names() -> dict[str, str]:
+    path = Path(
+        os.getenv("WHATSAPP_CONTACT_CACHE_FILE")
+        or (get_hermes_home() / "whatsapp" / "contacts_cache.json")
+    )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    contacts = payload.get("contacts", []) if isinstance(payload, dict) else []
+    names: dict[str, str] = {}
+    for contact in contacts:
+        if not isinstance(contact, dict):
+            continue
+        name = str(contact.get("name") or "").strip()
+        if not name:
+            continue
+        for key in ("id", "lid", "phoneNumber"):
+            ref = str(contact.get(key) or "").strip().lower()
+            if ref:
+                names[ref] = name
+                names[ref.split("@", 1)[0]] = name
+    return names
+
+
+def _whatsapp_display_contact(item: dict[str, Any], names: dict[str, str]) -> str:
+    for key in ("chatId", "senderId"):
+        ref = str(item.get(key) or "").strip().lower()
+        if not ref:
+            continue
+        resolved = names.get(ref) or names.get(ref.split("@", 1)[0])
+        if resolved:
+            return resolved
+    return str(item.get("chatName") or item.get("senderName") or item.get("chatId") or "WhatsApp")
+
+
 def _fetch_whatsapp_messages(since: datetime, until: datetime, limit: int) -> list[dict[str, Any]]:
     params = {"limit": str(max(1, min(limit, 300))), "direction": "all"}
     url = f"http://127.0.0.1:{_bridge_port()}/observed?{urlencode(params)}"
+    data: Any = None
     try:
-        with urlopen(url, timeout=5) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        cached = json.loads(_whatsapp_observed_cache_path().read_text(encoding="utf-8"))
+        data = cached.get("messages", []) if isinstance(cached, dict) else cached
     except Exception:
-        return []
+        pass
+    if not isinstance(data, list):
+        try:
+            with urlopen(url, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return []
     if not isinstance(data, list):
         return []
 
     rows: list[dict[str, Any]] = []
+    contact_names = _whatsapp_contact_names()
     for item in data:
         if not isinstance(item, dict):
+            continue
+        if item.get("isGroup") or str(item.get("chatId") or "").endswith("@g.us"):
             continue
         observed_at = _parse_dt(item.get("observedAt") or item.get("timestamp"))
         if observed_at is None or observed_at < since or observed_at > until:
@@ -275,7 +351,7 @@ def _fetch_whatsapp_messages(since: datetime, until: datetime, limit: int) -> li
                 "source": "whatsapp",
                 "source_id": source_id,
                 "thread_key": chat_id or str(item.get("chatName") or "whatsapp"),
-                "contact": item.get("chatName") or item.get("senderName") or chat_id or "WhatsApp",
+                "contact": _whatsapp_display_contact(item, contact_names),
                 "contact_ref": chat_id,
                 "direction": "outgoing" if item.get("direction") == "outgoing" else "incoming",
                 "message_at": _format_dt(observed_at),
@@ -288,7 +364,10 @@ def _fetch_whatsapp_messages(since: datetime, until: datetime, limit: int) -> li
                 },
             }
         )
-    return sorted(rows, key=lambda row: row["message_at"])
+    # Apply the limit after date/group filtering.  The bridge cache is often
+    # dominated by busy groups, which otherwise crowd direct conversations out
+    # of the follow-up scan.
+    return sorted(rows, key=lambda row: row["message_at"])[-max(1, min(limit, 300)) :]
 
 
 def _decode_header(raw: str) -> str:
@@ -309,6 +388,13 @@ def _extract_address(raw: str) -> str:
         if "<" in raw and ">" in raw:
             return raw.split("<", 1)[1].split(">", 1)[0].strip().lower()
         return raw.strip().lower()
+
+
+def _email_thread_key(subject: str, contact: str) -> str:
+    """Build a stable IMAP thread key for both inbound and sent copies."""
+    normalized_subject = re.sub(r"^(?:(?:re|fw|fwd)\s*:\s*)+", "", subject, flags=re.IGNORECASE)
+    normalized_subject = _clean_text(normalized_subject).casefold()
+    return _hash_key("email-thread", normalized_subject or "(no subject)", contact.casefold())
 
 
 def _extract_body(msg: email_lib.message.Message) -> str:
@@ -367,7 +453,7 @@ def _mailboxes(imap: imaplib.IMAP4_SSL) -> list[tuple[str, str]]:
     return mailboxes
 
 
-def _fetch_email_messages(since: datetime, until: datetime, limit: int) -> list[dict[str, Any]]:
+def _fetch_imap_email_messages(since: datetime, until: datetime, limit: int) -> list[dict[str, Any]]:
     if not _email_env_configured():
         return []
 
@@ -406,8 +492,9 @@ def _fetch_email_messages(since: datetime, until: datetime, limit: int) -> list[
                         msg = email_lib.message_from_bytes(raw)
                         headers = {str(key): str(value) for key, value in msg.items()}
                         sender_raw = msg.get("From", "")
+                        recipient_raw = msg.get("To", "")
                         sender_addr = _extract_address(sender_raw)
-                        recipient_addr = _extract_address(msg.get("To", ""))
+                        recipient_addr = _extract_address(recipient_raw)
                         direction = mailbox_direction
                         if sender_addr == address:
                             direction = "outgoing"
@@ -420,16 +507,25 @@ def _fetch_email_messages(since: datetime, until: datetime, limit: int) -> list[
                         sender_name = _decode_header(sender_raw)
                         if "<" in sender_name:
                             sender_name = sender_name.split("<", 1)[0].strip().strip('"')
+                        recipient_name = _decode_header(recipient_raw)
+                        if "<" in recipient_name:
+                            recipient_name = recipient_name.split("<", 1)[0].strip().strip('"')
+                        display_contact = sender_name if direction == "incoming" else recipient_name
                         subject = _decode_header(msg.get("Subject", "(no subject)"))
                         message_id = str(msg.get("Message-ID") or "").strip()
                         source_id = message_id or f"{mailbox}:{uid.decode('utf-8', errors='replace')}"
-                        thread_key = str(msg.get("Thread-Index") or msg.get("In-Reply-To") or subject or contact).strip()
+                        # Message-ID / In-Reply-To values identify individual
+                        # messages, so using them as the thread key splits the
+                        # user's sent reply from the inbound request.  Subject +
+                        # correspondent is a better cross-mailbox fallback when
+                        # only generic IMAP is available.
+                        thread_key = _email_thread_key(subject, contact or "")
                         rows.append(
                             {
                                 "source": "email",
                                 "source_id": source_id,
-                                "thread_key": _hash_key("email-thread", thread_key.lower()),
-                                "contact": sender_name or contact or "Email",
+                                "thread_key": thread_key,
+                                "contact": display_contact or contact or "Email",
                                 "contact_ref": contact,
                                 "direction": direction,
                                 "message_at": _format_dt(message_at),
@@ -451,6 +547,118 @@ def _fetch_email_messages(since: datetime, until: datetime, limit: int) -> list[
     return sorted(rows, key=lambda row: row["message_at"])
 
 
+def _gmail_token_path() -> Path:
+    return Path(os.getenv("GOOGLE_TOKEN_PATH") or (get_hermes_home() / "google_token.json"))
+
+
+def _gmail_body(payload: dict[str, Any]) -> str:
+    """Extract the first text/plain body from a Gmail API payload."""
+    mime_type = str(payload.get("mimeType") or "")
+    encoded = payload.get("body", {}).get("data")
+    if encoded and (mime_type.startswith("text/plain") or not mime_type):
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            return base64.urlsafe_b64decode(encoded + padding).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    for part in payload.get("parts", []) or []:
+        if isinstance(part, dict):
+            body = _gmail_body(part)
+            if body:
+                return body
+    return ""
+
+
+def _fetch_gmail_oauth_messages(since: datetime, until: datetime, limit: int) -> list[dict[str, Any]]:
+    token_path = _gmail_token_path()
+    if not token_path.exists():
+        return []
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+
+        token_payload = json.loads(token_path.read_text(encoding="utf-8"))
+        scopes = token_payload.get("scopes") if isinstance(token_payload, dict) else None
+        credentials = Credentials.from_authorized_user_file(str(token_path), scopes=scopes)
+        if credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+            refreshed = json.loads(credentials.to_json())
+            refreshed.setdefault("type", "authorized_user")
+            token_path.write_text(json.dumps(refreshed, indent=2), encoding="utf-8")
+        if not credentials.valid:
+            return []
+        service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+        profile = service.users().getProfile(userId="me").execute()
+        own_address = str(profile.get("emailAddress") or "").strip().lower()
+        query = f"after:{int(since.timestamp())} before:{int(until.timestamp()) + 1}"
+        listed = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=max(1, min(limit, 300)),
+            includeSpamTrash=False,
+        ).execute()
+    except Exception:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for message_ref in listed.get("messages", []) or []:
+        try:
+            message = service.users().messages().get(
+                userId="me",
+                id=message_ref["id"],
+                format="full",
+            ).execute()
+        except Exception:
+            continue
+        headers = {
+            str(header.get("name") or ""): str(header.get("value") or "")
+            for header in message.get("payload", {}).get("headers", [])
+            if isinstance(header, dict)
+        }
+        sender_raw = headers.get("From", "")
+        recipient_raw = headers.get("To", "")
+        sender_name, sender_addr = parseaddr(sender_raw)
+        recipient_name, recipient_addr = parseaddr(recipient_raw)
+        labels = set(message.get("labelIds", []) or [])
+        direction = "outgoing" if "SENT" in labels or sender_addr.lower() == own_address else "incoming"
+        if direction == "incoming" and _is_automated(sender_addr, headers):
+            continue
+        contact_ref = sender_addr if direction == "incoming" else recipient_addr
+        contact = sender_name if direction == "incoming" else recipient_name
+        try:
+            message_at = datetime.fromtimestamp(int(message.get("internalDate", "0")) / 1000, tz=timezone.utc)
+        except Exception:
+            message_at = _parse_dt(headers.get("Date")) or until
+        if message_at < since or message_at > until:
+            continue
+        subject = _decode_header(headers.get("Subject", "(no subject)"))
+        body = _gmail_body(message.get("payload", {})).strip() or str(message.get("snippet") or "").strip()
+        rows.append(
+            {
+                "source": "email",
+                "source_id": str(message["id"]),
+                "thread_key": _hash_key("gmail-thread", message.get("threadId") or message["id"]),
+                "contact": contact or contact_ref or "Email",
+                "contact_ref": contact_ref,
+                "direction": direction,
+                "message_at": _format_dt(message_at),
+                "subject": subject,
+                "body": body,
+                "metadata": {"gmail_thread_id": message.get("threadId"), "labels": sorted(labels)},
+            }
+        )
+    return sorted(rows, key=lambda row: row["message_at"])
+
+
+def _fetch_email_messages(since: datetime, until: datetime, limit: int) -> list[dict[str, Any]]:
+    if _gmail_token_path().exists():
+        oauth_rows = _fetch_gmail_oauth_messages(since, until, limit)
+        if oauth_rows:
+            return oauth_rows
+    return _fetch_imap_email_messages(since, until, limit)
+
+
 def _hash_key(*parts: Any) -> str:
     text = "\n".join(str(part or "") for part in parts)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
@@ -460,11 +668,20 @@ def _clean_text(text: str) -> str:
     return " ".join(str(text or "").split())
 
 
+def _without_urls(text: str) -> str:
+    return re.sub(r"https?://\S+|www\.\S+", "", text, flags=re.IGNORECASE)
+
+
 def _snippet(text: str, limit: int = 180) -> str:
     clean = _clean_text(text)
     if len(clean) <= limit:
         return clean
     return clean[: limit - 1].rstrip() + "..."
+
+
+def _is_non_actionable_incoming(text: str) -> bool:
+    """Return true for short acknowledgements that naturally close a thread."""
+    return bool(_INCOMING_CLOSURE_RE.fullmatch(_clean_text(text)))
 
 
 _INCOMING_ACTION_RE = re.compile(
@@ -474,14 +691,25 @@ _INCOMING_ACTION_RE = re.compile(
 )
 _OUTGOING_COMMIT_RE = re.compile(
     r"\b(i will|i'll|i can|i should|let me|will send|will share|will check|"
-    r"ping|will ping|message|will message|get back|circle back|follow up|"
-    r"tomorrow|tonight|later today|next week|monday|tuesday|wednesday|thursday|"
-    r"friday|saturday|sunday)\b",
+    r"will ping|will message|i(?:'ll| will) get back|i(?:'ll| will) circle back|"
+    r"i(?:'ll| will) follow up)\b",
     re.IGNORECASE,
 )
 _OUTGOING_WAITING_RE = re.compile(
     r"\b(can you|could you|please|let me know|waiting for|following up|any update|"
     r"thoughts|wdyt)\b|\?",
+    re.IGNORECASE,
+)
+_INCOMING_CLOSURE_RE = re.compile(
+    r"^(?:thanks(?:\s+(?:a lot|so much))?|thank you|sounds good|great|perfect|"
+    r"okay|ok|noted|got it|all good|cool|cheers|welcome)[.!\s🙏👍👌🙂😊]*$",
+    re.IGNORECASE,
+)
+_LOW_VALUE_EMAIL_RE = re.compile(
+    r"\b(purchase order|quotation|order confirmation|shipping|delivery confirmation|"
+    r"tracking|receipt|invoice|payment (?:notice|confirmation|received|due)|statement|"
+    r"one[- ]time password|otp|verify your account|newsletter|unsubscribe|promotional|"
+    r"limited[- ]time offer|account notification|security alert)\b",
     re.IGNORECASE,
 )
 
@@ -674,7 +902,16 @@ def _candidate_from_message(row: sqlite3.Row) -> dict[str, Any] | None:
     body = _clean_text(row["body"] or "")
     subject = _clean_text(row["subject"] or "")
     searchable = f"{subject} {body}".strip()
+    actionable_text = _without_urls(searchable)
     if len(searchable) < 8:
+        return None
+    try:
+        metadata = json.loads(row["metadata_json"] or "{}")
+    except Exception:
+        metadata = {}
+    if metadata.get("is_group") or metadata.get("is_broadcast"):
+        return None
+    if row["source"] == "email" and _LOW_VALUE_EMAIL_RE.search(searchable):
         return None
 
     direction = row["direction"]
@@ -685,11 +922,15 @@ def _candidate_from_message(row: sqlite3.Row) -> dict[str, Any] | None:
     suppress_until = None
     suppression_reason = None
     message_at = _parse_dt(row["message_at"]) or _now_utc()
-    if direction == "incoming" and _INCOMING_ACTION_RE.search(searchable):
+    if (
+        direction == "incoming"
+        and not _is_non_actionable_incoming(body)
+        and _INCOMING_ACTION_RE.search(actionable_text)
+    ):
         reason = "Looks like they asked for a response or action."
         action = "Reply or decide no reply is needed."
-        priority = 1 if "?" in searchable else 2
-    elif direction == "outgoing" and _OUTGOING_COMMIT_RE.search(searchable):
+        priority = 1 if "?" in actionable_text else 2
+    elif direction == "outgoing" and _OUTGOING_COMMIT_RE.search(actionable_text):
         due = _parse_followup_due(searchable, message_at)
         if due and due > _now_utc():
             status = "snoozed"
@@ -701,7 +942,7 @@ def _candidate_from_message(row: sqlite3.Row) -> dict[str, Any] | None:
             reason = "Looks like you committed to follow up."
             action = "Follow through or mark it done."
         priority = 1
-    elif direction == "outgoing" and _OUTGOING_WAITING_RE.search(searchable):
+    elif direction == "outgoing" and _OUTGOING_WAITING_RE.search(actionable_text):
         status = "waiting"
         reason = "Looks like you are waiting on them."
         action = "No action unless you want to follow up."
@@ -713,7 +954,10 @@ def _candidate_from_message(row: sqlite3.Row) -> dict[str, Any] | None:
     source_label = "email" if row["source"] == "email" else "WhatsApp"
     title = f"{row['contact']} via {source_label}{title_subject}"
     evidence = _snippet(body or subject, 220)
-    fingerprint = _hash_key(row["source"], row["thread_key"], action.lower(), title.lower())
+    # One live state per conversation.  The latest message decides whether the
+    # thread is active, waiting, or closed; action/title-specific fingerprints
+    # left stale items behind after the user replied.
+    fingerprint = _hash_key("thread-followup", row["source"], row["thread_key"])
     return {
         "fingerprint": fingerprint,
         "title": title[:240],
@@ -742,12 +986,17 @@ def _upsert_attention_item(
     now: datetime,
 ) -> int:
     now_text = _format_dt(now)
+    message_at = str((candidate.get("metadata") or {}).get("message_at") or now_text)
     existing = conn.execute(
         "SELECT id, status FROM attention_items WHERE fingerprint = ?",
         (candidate["fingerprint"],),
     ).fetchone()
     if existing:
-        if existing["status"] in {"done", "dismissed"}:
+        already_linked = conn.execute(
+            "SELECT 1 FROM item_messages WHERE item_id = ? AND message_id = ?",
+            (int(existing["id"]), message_id),
+        ).fetchone()
+        if existing["status"] in {"done", "dismissed"} and already_linked:
             item_id = int(existing["id"])
         else:
             conn.execute(
@@ -768,7 +1017,7 @@ def _upsert_attention_item(
                     candidate["status"],
                     candidate.get("suppress_until"),
                     candidate.get("suppression_reason"),
-                    now_text,
+                    message_at,
                     json.dumps(candidate.get("metadata") or {}, ensure_ascii=False),
                     int(existing["id"]),
                 ),
@@ -795,8 +1044,8 @@ def _upsert_attention_item(
                 candidate["priority"],
                 candidate["reason"],
                 candidate["evidence"],
-                now_text,
-                now_text,
+                message_at,
+                message_at,
                 candidate.get("suppress_until"),
                 candidate.get("suppression_reason"),
                 json.dumps(candidate.get("metadata") or {}, ensure_ascii=False),
@@ -810,20 +1059,114 @@ def _upsert_attention_item(
     return item_id
 
 
+def _close_open_thread_items(
+    conn: sqlite3.Connection,
+    source: str,
+    thread_key: str,
+    *,
+    except_item_id: int | None = None,
+    reason: str,
+) -> None:
+    params: list[Any] = [reason, source, thread_key]
+    except_clause = ""
+    if except_item_id is not None:
+        except_clause = " AND id != ?"
+        params.append(except_item_id)
+    conn.execute(
+        f"""
+        UPDATE attention_items
+        SET status = 'done', suppression_reason = ?, suppress_until = NULL
+        WHERE source = ? AND thread_key = ?
+          AND status IN ('active', 'waiting', 'snoozed')
+          {except_clause}
+        """,
+        params,
+    )
+
+
+def _reconcile_thread(conn: sqlite3.Connection, source: str, thread_key: str, now: datetime) -> bool:
+    """Resolve a conversation from its latest message, not isolated snippets."""
+    latest = conn.execute(
+        """
+        SELECT * FROM source_messages
+        WHERE source = ? AND thread_key = ?
+        ORDER BY message_at DESC, id DESC
+        LIMIT 1
+        """,
+        (source, thread_key),
+    ).fetchone()
+    if latest is None:
+        return False
+
+    # Respect explicit feedback on this exact message.  A genuinely newer
+    # message may reopen the thread, but rescanning the same message may not.
+    explicitly_resolved = conn.execute(
+        """
+        SELECT 1
+        FROM attention_items AS item
+        JOIN item_messages AS link ON link.item_id = item.id
+        WHERE link.message_id = ? AND item.status IN ('done', 'dismissed')
+        LIMIT 1
+        """,
+        (int(latest["id"]),),
+    ).fetchone()
+    if explicitly_resolved:
+        _close_open_thread_items(
+            conn,
+            source,
+            thread_key,
+            reason="resolved by user feedback",
+        )
+        return False
+
+    candidate = _candidate_from_message(latest)
+    if candidate is None:
+        _close_open_thread_items(
+            conn,
+            source,
+            thread_key,
+            reason="closed by the latest message",
+        )
+        return False
+
+    item_id = _upsert_attention_item(conn, candidate, int(latest["id"]), now)
+    _close_open_thread_items(
+        conn,
+        source,
+        thread_key,
+        except_item_id=item_id,
+        reason="superseded by the latest message",
+    )
+    return True
+
+
 def _scan_sources(conn: sqlite3.Connection, since: datetime, until: datetime, limit: int, dry_run: bool) -> dict[str, int]:
     now = _now_utc()
     source_rows = _fetch_whatsapp_messages(since, until, limit) + _fetch_email_messages(since, until, limit)
     counts = {"messages": len(source_rows), "items_created_or_updated": 0}
     if dry_run:
         return counts
+    threads = {(row["source"], row["thread_key"]) for row in source_rows}
     for source_row in source_rows:
-        message_id = _upsert_source_message(conn, source_row, now)
-        stored = conn.execute("SELECT * FROM source_messages WHERE id = ?", (message_id,)).fetchone()
-        candidate = _candidate_from_message(stored)
-        if not candidate:
-            continue
-        _upsert_attention_item(conn, candidate, message_id, now)
-        counts["items_created_or_updated"] += 1
+        _upsert_source_message(conn, source_row, now)
+
+    # Also reconcile older open items.  This migrates stale stores where an
+    # outgoing reply had already arrived but the older inbound candidate was
+    # never closed.
+    threads.update(
+        (row["source"], row["thread_key"])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT source, thread_key
+            FROM attention_items
+            WHERE source IN ('email', 'whatsapp')
+              AND status IN ('active', 'waiting', 'snoozed')
+            """
+        )
+    )
+    for source, thread_key in threads:
+        if _reconcile_thread(conn, source, thread_key, now):
+            counts["items_created_or_updated"] += 1
     conn.commit()
     return counts
 
@@ -947,8 +1290,21 @@ def _parse_public_id(value: Any) -> int | None:
 
 
 def _render_digest(conn: sqlite3.Connection, now: datetime, counts: dict[str, int]) -> str:
-    active = _visible_items(conn, now, "active")
-    waiting = _visible_items(conn, now, "waiting")[:5]
+    freshness_cutoff = now - timedelta(days=DIGEST_MAX_AGE_DAYS)
+    waiting_cutoff = now - timedelta(days=WAITING_MIN_AGE_DAYS)
+
+    def fresh(row: sqlite3.Row) -> bool:
+        seen = _parse_dt(row["last_seen_at"])
+        return seen is None or seen >= freshness_cutoff
+
+    active = [row for row in _visible_items(conn, now, "active") if fresh(row)]
+    waiting = [
+        row
+        for row in _visible_items(conn, now, "waiting")
+        if fresh(row)
+        and (seen := _parse_dt(row["last_seen_at"])) is not None
+        and seen <= waiting_cutoff
+    ][:5]
     visible_ids = [int(row["id"]) for row in active]
     _set_meta(conn, "last_digest_item_ids", visible_ids)
     _set_meta(conn, "last_digest_at", _format_dt(now))
