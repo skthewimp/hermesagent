@@ -64,6 +64,9 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_TOOL_MEDIA_TAG_RE = re.compile(
+    r'''MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+)'''
+)
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -84,6 +87,52 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
         return f"/{sanitized}" if sanitized else match.group(0)
 
     return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
+
+
+def _collect_existing_tool_media_tags(
+    messages: List[Dict[str, Any]],
+    history_media_paths: set[str],
+) -> tuple[List[str], bool]:
+    """Collect deliverable MEDIA tags emitted by tools in the current turn.
+
+    Tool output can contain documentation and skill templates with placeholder
+    tags such as ``MEDIA:/absolute/path/to/chart.png``.  Only append tags whose
+    local file currently exists; otherwise a failed agent turn can turn an
+    example into a bogus attachment attempt and strip it from the useful error
+    text.  Hermes MEDIA delivery is intentionally local-file based, so this
+    check does not exclude any supported tool attachment.
+    """
+    media_tags: List[str] = []
+    has_voice_directive = False
+
+    for msg in messages:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str) or "MEDIA:" not in content:
+            continue
+
+        found_valid_media = False
+        for match in _TOOL_MEDIA_TAG_RE.finditer(content):
+            path = match.group("path").strip()
+            if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+                path = path[1:-1].strip()
+            path = path.rstrip('",};)]')
+            expanded_path = os.path.expanduser(path)
+            if (
+                not path
+                or path in history_media_paths
+                or expanded_path in history_media_paths
+                or not os.path.isfile(expanded_path)
+            ):
+                continue
+            media_tags.append(f"MEDIA:{expanded_path}")
+            found_valid_media = True
+
+        if found_valid_media and "[[audio_as_voice]]" in content:
+            has_voice_directive = True
+
+    return media_tags, has_voice_directive
 
 
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
@@ -16008,18 +16057,10 @@ class GatewayRunner:
             # before run_conversation) instead of index slicing. This is safe even
             # when context compression shrinks the message list. (Fixes #160)
             if "MEDIA:" not in final_response:
-                media_tags = []
-                has_voice_directive = False
-                for msg in result.get("messages", []):
-                    if msg.get("role") in {"tool", "function"}:
-                        content = msg.get("content", "")
-                        if "MEDIA:" in content:
-                            for match in re.finditer(r'MEDIA:(\S+)', content):
-                                path = match.group(1).strip().rstrip('",}')
-                                if path and path not in _history_media_paths:
-                                    media_tags.append(f"MEDIA:{path}")
-                            if "[[audio_as_voice]]" in content:
-                                has_voice_directive = True
+                media_tags, has_voice_directive = _collect_existing_tool_media_tags(
+                    result.get("messages", []),
+                    _history_media_paths,
+                )
                 
                 if media_tags:
                     seen = set()
