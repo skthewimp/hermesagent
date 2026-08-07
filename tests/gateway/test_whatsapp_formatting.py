@@ -18,7 +18,7 @@ from gateway.config import Platform, PlatformConfig
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_adapter():
+def _make_adapter(*, outbound_disabled=False):
     """Create a WhatsAppAdapter with test attributes (bypass __init__)."""
     from gateway.platforms.whatsapp import WhatsAppAdapter
 
@@ -26,6 +26,8 @@ def _make_adapter():
     adapter.platform = Platform.WHATSAPP
     adapter.config = MagicMock()
     adapter.config.extra = {}
+    if outbound_disabled is not None:
+        adapter.config.extra["outbound_disabled"] = outbound_disabled
     adapter._bridge_port = 3000
     adapter._bridge_script = "/tmp/test-bridge.js"
     adapter._session_path = MagicMock()
@@ -229,6 +231,34 @@ class TestSendChunking:
         adapter = _make_adapter()
         result = await adapter.send("chat1", "   \n  ")
         assert result.success
+        assert adapter._http_session.post.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_outbound_disabled_suppresses_text_send(self, monkeypatch):
+        adapter = _make_adapter(outbound_disabled=None)
+        monkeypatch.setenv("WHATSAPP_OUTBOUND_DISABLED", "true")
+
+        result = await adapter.send("chat1", "hello")
+
+        assert result.success
+        assert result.raw_response == {
+            "suppressed": True,
+            "reason": "whatsapp_outbound_disabled",
+        }
+        assert adapter._http_session.post.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_outbound_disabled_suppresses_media_send(self, monkeypatch):
+        adapter = _make_adapter(outbound_disabled=None)
+        monkeypatch.setenv("WHATSAPP_OUTBOUND_DISABLED", "true")
+
+        result = await adapter._send_media_to_bridge("chat1", "/tmp/missing.png", "image")
+
+        assert result.success
+        assert result.raw_response == {
+            "suppressed": True,
+            "reason": "whatsapp_outbound_disabled",
+        }
         assert adapter._http_session.post.call_count == 0
 
     @pytest.mark.asyncio

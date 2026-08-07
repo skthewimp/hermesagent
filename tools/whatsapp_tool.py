@@ -207,7 +207,7 @@ def whatsapp_tool(args, **kw):
         query = str(args.get("query") or chat).strip()
         return json.dumps(
             {
-                "storage": "in_memory_only",
+                "storage": "bridge_cache",
                 "contacts": _fetch_live_contacts(query, limit),
             },
             ensure_ascii=False,
@@ -224,7 +224,7 @@ def whatsapp_tool(args, **kw):
     if action == "recent":
         return json.dumps(
             {
-                "storage": "in_memory_only",
+                "storage": "bridge_cache",
                 "messages": [_clean_record(msg, contacts) for msg in messages[-limit:]],
             },
             ensure_ascii=False,
@@ -237,7 +237,7 @@ def whatsapp_tool(args, **kw):
         matches = [msg for msg in messages if query in str(msg.get("body") or "").lower()]
         return json.dumps(
             {
-                "storage": "in_memory_only",
+                "storage": "bridge_cache",
                 "matches": [_clean_record(msg, contacts) for msg in matches[-limit:]],
             },
             ensure_ascii=False,
@@ -269,7 +269,7 @@ def whatsapp_tool(args, **kw):
             key=lambda item: item.get("lastObservedAt") or datetime.min.isoformat(),
             reverse=True,
         )
-        return json.dumps({"storage": "in_memory_only", "chats": chats[:limit]}, ensure_ascii=False)
+        return json.dumps({"storage": "bridge_cache", "chats": chats[:limit]}, ensure_ascii=False)
 
     return tool_error(f"Unknown WhatsApp action: {action}")
 
