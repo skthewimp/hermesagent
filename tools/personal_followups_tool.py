@@ -11,9 +11,11 @@ import re
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import hermes_time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -531,35 +533,69 @@ _MONTHS = {
 }
 
 
-def _start_of_day_utc(dt: datetime) -> datetime:
-    return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+FOLLOWUP_REMINDER_HOUR = 10
+FOLLOWUP_REMINDER_MINUTE = 30
+
+
+def _local_timezone():
+    tz = None
+    try:
+        tz = hermes_time.get_timezone()
+    except Exception:
+        tz = None
+    if tz is not None:
+        return tz
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def _at_followup_time(year: int, month: int, day: int, tzinfo) -> datetime:
+    return datetime(year, month, day, FOLLOWUP_REMINDER_HOUR, FOLLOWUP_REMINDER_MINUTE, tzinfo=tzinfo)
 
 
 def _next_weekday(base: datetime, weekday: int, *, force_next_week: bool = False) -> datetime:
-    base_day = _start_of_day_utc(base)
-    days = (weekday - base_day.weekday()) % 7
-    if days == 0 or force_next_week:
-        days += 7
-    return base_day + timedelta(days=days)
+    tz = _local_timezone()
+    base_local = base.astimezone(tz)
+    current_week_monday = base_local.date() - timedelta(days=base_local.weekday())
+    candidate_date = current_week_monday + timedelta(days=weekday)
+    if force_next_week:
+        candidate_date += timedelta(days=7)
+    elif candidate_date <= base_local.date():
+        candidate_date += timedelta(days=7)
+    return _at_followup_time(candidate_date.year, candidate_date.month, candidate_date.day, tz)
+
+
+def _first_business_day_of_month(year: int, month: int, tzinfo) -> datetime:
+    for day in range(1, 4):
+        candidate = _at_followup_time(year, month, day, tzinfo)
+        if candidate.weekday() < 5:
+            return candidate
+    return _at_followup_time(year, month, 1, tzinfo)
 
 
 def _parse_followup_due(text: str, base: datetime) -> datetime | None:
     lowered = f" {text.lower()} "
+    tz = _local_timezone()
+    base_local = base.astimezone(tz)
     if re.search(r"\b(later today|tonight|today)\b", lowered):
-        return _start_of_day_utc(base)
+        return _at_followup_time(base_local.year, base_local.month, base_local.day, tz)
     if re.search(r"\btomorrow\b", lowered):
-        return _start_of_day_utc(base) + timedelta(days=1)
+        tomorrow = base_local.date() + timedelta(days=1)
+        return _at_followup_time(tomorrow.year, tomorrow.month, tomorrow.day, tz)
     if re.search(r"\bnext week\b", lowered):
-        return _start_of_day_utc(base) + timedelta(days=7)
+        return _next_weekday(base, 0)
+    if re.search(r"\bnext month\b", lowered):
+        year = base_local.year + (1 if base_local.month == 12 else 0)
+        month = 1 if base_local.month == 12 else base_local.month + 1
+        return _first_business_day_of_month(year, month, tz)
 
     iso_match = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", lowered)
     if iso_match:
         try:
-            return datetime(
+            return _at_followup_time(
                 int(iso_match.group(1)),
                 int(iso_match.group(2)),
                 int(iso_match.group(3)),
-                tzinfo=timezone.utc,
+                tz,
             )
         except ValueError:
             pass
@@ -574,11 +610,11 @@ def _parse_followup_due(text: str, base: datetime) -> datetime | None:
         else:
             month = _MONTHS[month_date.group(1)]
             day = int(month_date.group(2))
-        year = base.year
+        year = base_local.year
         try:
-            due = datetime(year, month, day, tzinfo=timezone.utc)
-            if due.date() < base.date():
-                due = datetime(year + 1, month, day, tzinfo=timezone.utc)
+            due = _at_followup_time(year, month, day, tz)
+            if due.date() < base_local.date():
+                due = _at_followup_time(year + 1, month, day, tz)
             return due
         except ValueError:
             pass
@@ -655,7 +691,7 @@ def _candidate_from_message(row: sqlite3.Row) -> dict[str, Any] | None:
         priority = 1 if "?" in searchable else 2
     elif direction == "outgoing" and _OUTGOING_COMMIT_RE.search(searchable):
         due = _parse_followup_due(searchable, message_at)
-        if due and due > _start_of_day_utc(_now_utc()):
+        if due and due > _now_utc():
             status = "snoozed"
             suppress_until = _format_dt(due)
             suppression_reason = "dated follow-up commitment"
@@ -812,7 +848,7 @@ def _log_followup(conn: sqlite3.Connection, args: dict[str, Any]) -> str:
             },
             ensure_ascii=False,
         )
-    status = "snoozed" if due and due > _start_of_day_utc(now) else "active"
+    status = "snoozed" if due and due > now else "active"
     suppress_until = _format_dt(due) if status == "snoozed" and due else None
     source_id = _hash_key("manual-log", source, contact, raw_text, _format_dt(now))
     thread_key = _hash_key("manual-thread", source, contact)
