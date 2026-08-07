@@ -80,6 +80,10 @@ Use:
   context.
 - Domain-specific palettes when meaningful: weather, wind direction, cricket teams,
   political parties, etc.
+- For multi-series line charts, prefer one strong focal color plus one or two clearly
+  differentiated supporting colors; avoid washed-out grays for real data series unless
+  the gray is intentionally contextual.
+- Keep series colors legible after Telegram/chat image compression.
 
 Text:
 - Main text: `#3C3C3C`
@@ -103,7 +107,7 @@ Use sans fonts:
 
 Rules:
 - Title: bold, charcoal.
-- Subtitle: regular, smaller, muted or accent color.
+- Subtitle: regular, smaller, and limited to the chart's insight/comparison; do not describe the process of making the chart.
 - Axis text: bold, charcoal.
 - Facet labels: bold.
 - Caption/source: small, regular, charcoal or grey.
@@ -134,6 +138,7 @@ structure, but they should not look like default gridlines.
 - Drop axis titles when redundant.
 - Dates usually do not need an x-axis title.
 - Obvious categories do not need an axis title.
+- If direct labels already identify every series and the scale is obvious, consider removing or minimizing axes rather than repeating the same information.
 - Use thin axis lines: `linewidth = 0.2-0.3`.
 - Remove top and right spines.
 - Drop tick marks when labels suffice.
@@ -219,6 +224,8 @@ Preferred, roughly in order:
 6. Ribbon/area charts for uncertainty or cumulative ranges.
 7. Scatter + smooth for relationships.
 8. Ridgelines for distributions across groups.
+
+Prefer line charts over stacked bars when the main job is a trend comparison over time. Use stacked bars only when part-to-whole composition is the point.
 
 Avoid:
 - Pie charts.

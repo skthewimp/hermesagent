@@ -33,6 +33,7 @@ Core operating rules:
 - Make visual hierarchy match information hierarchy: data, labels, annotations, grids, borders.
 - Show comparison and context explicitly; a chart should answer "compared to what?"
 - Use color sparingly: gray for context, color for emphasis or true encoding.
+- Keep series colors legible in chat-sized exports; pick a stronger palette if the output will be compressed.
 - Let complexity come from the data, not decoration.
 
 When writing or changing chart code:
