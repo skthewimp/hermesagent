@@ -37,7 +37,13 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def _make_agent(fallback_model=None):
+def _make_agent(
+    fallback_model=None,
+    *,
+    provider=None,
+    model=None,
+    base_url="https://openrouter.ai/api/v1",
+):
     """Create a minimal AIAgent with optional fallback config."""
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
@@ -46,7 +52,9 @@ def _make_agent(fallback_model=None):
     ):
         agent = AIAgent(
             api_key="test-key",
-            base_url="https://openrouter.ai/api/v1",
+            base_url=base_url,
+            provider=provider,
+            model=model or "anthropic/claude-opus-4.6",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -105,6 +113,81 @@ class TestTryActivateFallback:
             assert agent.provider == "openrouter"
             assert agent.api_mode == "chat_completions"
             assert agent.client is mock_client
+
+    def test_codex_gpt54_mini_stale_timeout_uses_builtin_fallback(self):
+        agent = _make_agent(
+            provider="openai-codex",
+            model="gpt-5.4-mini",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        assert agent._fallback_chain == []
+
+        mock_client = _mock_resolve(
+            api_key="codex-token",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        error = TimeoutError(
+            "Non-streaming API call timed out after 300s with no response "
+            "(threshold: 300s)"
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "gpt-5.3-codex"),
+        ):
+            result = agent._try_activate_stale_timeout_fallback(error)
+
+        assert result is True
+        assert agent._fallback_activated is True
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.3-codex"
+        assert agent.api_mode == "codex_responses"
+        assert agent._fallback_chain[1] == {
+            "provider": "openai-codex",
+            "model": "gpt-5.2-codex",
+        }
+
+    def test_codex_gpt54_mini_non_stale_timeout_does_not_use_builtin_fallback(self):
+        agent = _make_agent(
+            provider="openai-codex",
+            model="gpt-5.4-mini",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        result = agent._try_activate_stale_timeout_fallback(
+            TimeoutError("regular read timeout")
+        )
+        assert result is False
+        assert agent._fallback_chain == []
+
+    def test_codex_stale_timeout_prefers_configured_fallback(self):
+        agent = _make_agent(
+            provider="openai-codex",
+            model="gpt-5.4-mini",
+            base_url="https://chatgpt.com/backend-api/codex",
+            fallback_model={
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+            },
+        )
+        mock_client = _mock_resolve(
+            api_key="sk-or-fallback-key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        error = TimeoutError(
+            "Non-streaming API call timed out after 300s with no response "
+            "(threshold: 300s)"
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "anthropic/claude-sonnet-4"),
+        ):
+            result = agent._try_activate_stale_timeout_fallback(error)
+
+        assert result is True
+        assert agent.provider == "openrouter"
+        assert agent.model == "anthropic/claude-sonnet-4"
+        assert agent._fallback_chain == [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+        ]
 
     def test_activates_zai_fallback(self):
         agent = _make_agent(

@@ -71,6 +71,11 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 
 
+_CODEX_GPT54_MINI_STALE_FALLBACK_CHAIN = [
+    {"provider": "openai-codex", "model": "gpt-5.3-codex"},
+    {"provider": "openai-codex", "model": "gpt-5.2-codex"},
+]
+
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
@@ -7160,7 +7165,7 @@ class AIAgent:
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
                     _out = getattr(final_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             final_response.output = list(collected_output_items)
                             logger.debug(
@@ -7244,6 +7249,16 @@ class AIAgent:
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+            except TypeError as exc:
+                err_text = str(exc)
+                if "'NoneType' object is not iterable" in err_text:
+                    logger.warning(
+                        "Codex Responses stream parser hit None iterable response shape; "
+                        "retrying with create(stream=True). %s",
+                        self._client_log_context(),
+                    )
+                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                raise
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -7292,7 +7307,7 @@ class AIAgent:
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
                             logger.debug(
@@ -9190,6 +9205,55 @@ class AIAgent:
         except Exception as e:
             logging.error("Failed to activate fallback %s: %s", fb_model, e)
             return self._try_activate_fallback()  # try next in chain
+
+    def _is_codex_gpt54_mini_stale_timeout(self, error: BaseException) -> bool:
+        """Return True for Codex gpt-5.4-mini calls killed by the stale detector."""
+        provider = (getattr(self, "provider", "") or "").strip().lower()
+        model = (getattr(self, "model", "") or "").strip().lower().rsplit("/", 1)[-1]
+        if provider != "openai-codex" or model != "gpt-5.4-mini":
+            return False
+        if not isinstance(error, TimeoutError):
+            return False
+        msg = str(error).lower()
+        return (
+            "non-streaming api call timed out" in msg
+            and "with no response" in msg
+        )
+
+    def _try_activate_stale_timeout_fallback(self, error: BaseException) -> bool:
+        """Fail over immediately for known-stale Codex gpt-5.4-mini calls.
+
+        User-configured fallbacks stay first.  If none are configured, lazily
+        append the curated Codex downgrade chain so a stuck gpt-5.4-mini call
+        doesn't burn repeated 300s stale-timeout cycles against the same model.
+        """
+        if not self._is_codex_gpt54_mini_stale_timeout(error):
+            return False
+
+        if self._fallback_index >= len(self._fallback_chain):
+            existing = {
+                (
+                    (entry.get("provider") or "").strip().lower(),
+                    (entry.get("model") or "").strip().lower(),
+                )
+                for entry in (self._fallback_chain or [])
+                if isinstance(entry, dict)
+            }
+            for entry in _CODEX_GPT54_MINI_STALE_FALLBACK_CHAIN:
+                key = (entry["provider"], entry["model"])
+                if key not in existing:
+                    self._fallback_chain.append(dict(entry))
+                    existing.add(key)
+            self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+
+        if self._fallback_index >= len(self._fallback_chain):
+            return False
+
+        self._emit_status(
+            "⚠️ gpt-5.4-mini did not respond within the stale timeout — "
+            "switching to fallback model..."
+        )
+        return self._try_activate_fallback(reason=FailoverReason.timeout)
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
@@ -13908,6 +13972,12 @@ class AIAgent:
                         error_context=error_context,
                     )
                     if recovered_with_pool:
+                        continue
+
+                    if self._try_activate_stale_timeout_fallback(api_error):
+                        retry_count = 0
+                        compression_attempts = 0
+                        primary_recovery_attempted = False
                         continue
 
                     # Image-too-large recovery: shrink oversized native image
