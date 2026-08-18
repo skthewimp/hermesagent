@@ -269,7 +269,17 @@ def _extract_output_tail(
     return tail
 
 
-def _looks_like_error_output(content: str) -> bool:
+def _tool_content_text(content: Any) -> str:
+    """Return stable text for string or multimodal tool-result content."""
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except Exception:
+        return str(content)
+
+
+def _looks_like_error_output(content: Any) -> bool:
     """Conservative stderr/error detector for tool-result previews.
 
     The old heuristic flagged any preview containing the substring "error",
@@ -279,6 +289,7 @@ def _looks_like_error_output(content: str) -> bool:
       - structured JSON with ``status`` of error/failed
       - first line starts with a classic error marker
     """
+    content = _tool_content_text(content)
     if not content:
         return False
 
@@ -1649,9 +1660,10 @@ def _run_single_child(
                             trace_by_id[tc_id] = entry_t
                 elif msg.get("role") == "tool":
                     content = msg.get("content", "")
-                    is_error = bool(content and "error" in content[:80].lower())
+                    content_text = _tool_content_text(content)
+                    is_error = _looks_like_error_output(content_text)
                     result_meta = {
-                        "result_bytes": len(content),
+                        "result_bytes": len(content_text),
                         "status": "error" if is_error else "ok",
                     }
                     # Match by tool_call_id for parallel calls
