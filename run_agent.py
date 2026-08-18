@@ -652,6 +652,23 @@ def _sanitize_surrogates(text: str) -> str:
 # (see import block above). Remains importable from run_agent for backward compat.
 
 
+def _inject_user_message_context(content: Any, injections: List[str]) -> Any:
+    """Append ephemeral context to string or multimodal user content.
+
+    Multimodal user messages use a list of typed content blocks.  Returning a
+    new list keeps the persisted conversation untouched while ensuring plugin
+    and memory context reaches the API request for image-bearing turns.
+    """
+    context = "\n\n".join(part for part in injections if part)
+    if not context:
+        return content
+    if isinstance(content, str):
+        return content + "\n\n" + context
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": context}]
+    return content
+
+
 def _sanitize_structure_surrogates(payload: Any) -> bool:
     """Replace surrogate code points in nested dict/list payloads in-place.
 
@@ -12765,8 +12782,9 @@ class AIAgent:
                         _injections.append(_plugin_user_context)
                     if _injections:
                         _base = api_msg.get("content", "")
-                        if isinstance(_base, str):
-                            api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+                        api_msg["content"] = _inject_user_message_context(
+                            _base, _injections
+                        )
 
                 # For ALL assistant messages, pass reasoning back to the API
                 # This ensures multi-turn reasoning context is preserved
