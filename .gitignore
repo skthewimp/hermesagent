@@ -73,3 +73,7 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+
+# Local Noenthuda archive integration
+/scripts/noenthuda_archive.py
+/tests/scripts/test_noenthuda_archive.py

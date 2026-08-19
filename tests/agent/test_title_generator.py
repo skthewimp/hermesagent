@@ -1,10 +1,12 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.auxiliary_client import _CodexCompletionsAdapter
 from agent.title_generator import (
     generate_title,
     auto_title_session,
@@ -112,6 +114,35 @@ class TestGenerateTitle:
         # The user content in the messages should be truncated
         user_content = captured_kwargs["messages"][1]["content"]
         assert len(user_content) < 1100  # 500 + 500 + formatting
+
+    def test_codex_auxiliary_title_handles_none_output(self):
+        """Codex can return final.output=None; title generation must not warn."""
+
+        class FakeStream:
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(type="response.output_text.delta", delta="Reminder Setup"),
+                ])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get_final_response(self):
+                return SimpleNamespace(output=None, usage=None)
+
+        real_client = SimpleNamespace(
+            responses=SimpleNamespace(stream=lambda **kwargs: FakeStream()),
+            close=lambda: None,
+        )
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.4-mini")
+
+        with patch("agent.title_generator.call_llm", side_effect=adapter.create):
+            title = generate_title("remind me Monday", "Done, I set a reminder.")
+
+        assert title == "Reminder Setup"
 
 
 class TestAutoTitleSession:

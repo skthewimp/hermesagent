@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 from agent.file_safety import get_read_block_error
+from hermes_constants import get_hermes_home
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -76,6 +77,48 @@ _BLOCKED_DEVICE_PATHS = frozenset({
     # fd aliases
     "/dev/fd/0", "/dev/fd/1", "/dev/fd/2",
 })
+
+_HERMES_SECRET_FILENAMES = frozenset({
+    ".env",
+    "auth.json",
+    "google_token.json",
+    "google_client_secret.json",
+    "google_oauth_pending.json",
+})
+
+
+def _is_blocked_secret_path(path: Path) -> bool:
+    """Return True for local credential files that must not enter model context."""
+    lexical = Path(path).expanduser()
+    if not lexical.is_absolute():
+        lexical = Path.cwd() / lexical
+    try:
+        resolved = lexical.resolve()
+    except Exception:
+        resolved = lexical
+    try:
+        home = get_hermes_home().expanduser().resolve()
+    except Exception:
+        home = Path.home() / ".hermes"
+
+    homes = {home}
+    try:
+        homes.add((Path.home() / ".hermes").resolve())
+    except Exception:
+        homes.add(Path.home() / ".hermes")
+
+    for candidate_path in {lexical, resolved}:
+        under_hermes = any(
+            candidate_path == candidate or candidate in candidate_path.parents
+            for candidate in homes
+        )
+        if not under_hermes:
+            continue
+        if candidate_path.name in _HERMES_SECRET_FILENAMES:
+            return True
+        if any(part in {"credentials", "tokens"} for part in candidate_path.parts):
+            return True
+    return False
 
 
 def _resolve_path(filepath: str, task_id: str = "default") -> Path:
@@ -461,6 +504,19 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             })
 
         _resolved = _resolve_path_for_task(path, task_id)
+
+        # ── Local secret-file guard ──────────────────────────────────────
+        # Credential files are meant to be consumed by helper code, not copied
+        # into model context. Redaction is a last line of defense, but the
+        # correct behavior is to deny the read before file contents are loaded.
+        if _is_blocked_secret_path(Path(path)) or _is_blocked_secret_path(_resolved):
+            return json.dumps({
+                "error": (
+                    f"Cannot read '{path}': this is a Hermes credential or "
+                    "secret file. Use the relevant setup/check command or "
+                    "service-specific tool instead."
+                ),
+            })
 
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).

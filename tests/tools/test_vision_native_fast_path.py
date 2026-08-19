@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from tools.vision_tools import (
+    VISION_ANALYZE_SCHEMA,
     _build_native_vision_tool_result,
     _handle_vision_analyze,
     _supports_media_in_tool_results,
@@ -28,6 +29,11 @@ from tools.vision_tools import (
 _TINY_PNG = base64.b64decode(
     b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 )
+
+
+def test_schema_avoids_reloading_current_inline_image():
+    description = VISION_ANALYZE_SCHEMA["description"]
+    assert "already attached inline to the current user message" in description
 
 
 # ─── _supports_media_in_tool_results ─────────────────────────────────────────

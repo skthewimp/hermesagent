@@ -185,6 +185,33 @@ def _make_photo(file_obj=None):
 
 class TestDocumentDownloadBlock:
     @pytest.mark.asyncio
+    async def test_voice_note_is_echoed_before_forwarding(self, adapter):
+        voice = MagicMock()
+        voice.file_id = "voice-file-id"
+        msg = _make_message()
+        msg.voice = voice
+        msg.reply_text = AsyncMock()
+        update = _make_update(msg)
+
+        handle_called = asyncio.Event()
+
+        async def _handle_message(event):
+            assert msg.reply_text.await_count == 1
+            assert event.text == "hello transcript"
+            assert event.message_type == MessageType.TEXT
+            handle_called.set()
+
+        adapter.handle_message = AsyncMock(side_effect=_handle_message)
+
+        with patch("gateway.platforms.telegram._get_openai_api_key", return_value="test-key"), \
+             patch("gateway.platforms.telegram.downloadTelegramVoice", new=AsyncMock(return_value="/tmp/voice.ogg")), \
+             patch("gateway.platforms.telegram.transcribeAudio", return_value="hello transcript"):
+            await adapter._handle_media_message(update, MagicMock())
+
+        msg.reply_text.assert_awaited_once_with("hello transcript")
+        assert handle_called.is_set()
+
+    @pytest.mark.asyncio
     async def test_supported_pdf_is_cached(self, adapter):
         pdf_bytes = b"%PDF-1.4 fake"
         file_obj = _make_file_obj(pdf_bytes)

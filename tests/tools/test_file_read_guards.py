@@ -12,6 +12,7 @@ import os
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from tools.file_tools import (
@@ -19,6 +20,7 @@ from tools.file_tools import (
     write_file_tool,
     reset_file_dedup,
     _is_blocked_device,
+    _is_blocked_secret_path,
     _invalidate_dedup_for_path,
     _READ_DEDUP_STATUS_MESSAGE,
     _get_max_read_chars,
@@ -89,6 +91,38 @@ class TestDevicePathBlocking(unittest.TestCase):
         result = json.loads(read_file_tool("/dev/zero", task_id="dev_test"))
         self.assertIn("error", result)
         self.assertIn("device file", result["error"])
+
+
+class TestSecretPathBlocking(unittest.TestCase):
+    """Hermes credential files must not be returned to model context."""
+
+    def test_google_token_path_is_blocked(self):
+        self.assertTrue(_is_blocked_secret_path(
+            os.path.expanduser("~/.hermes/google_token.json")
+        ))
+
+    def test_read_file_tool_rejects_google_token(self):
+        result = json.loads(read_file_tool("~/.hermes/google_token.json", task_id="secret"))
+        self.assertIn("error", result)
+        self.assertIn("credential or secret file", result["error"])
+
+    def test_regular_home_file_not_blocked(self):
+        self.assertFalse(_is_blocked_secret_path(
+            os.path.expanduser("~/notes.txt")
+        ))
+
+    def test_secret_symlink_is_blocked_by_lexical_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hermes_home = root / ".hermes"
+            hermes_home.mkdir()
+            target = root / "ordinary-name.json"
+            target.write_text('{"token": "secret"}', encoding="utf-8")
+            link = hermes_home / "google_token.json"
+            link.symlink_to(target)
+
+            with patch("tools.file_tools.get_hermes_home", return_value=hermes_home):
+                self.assertTrue(_is_blocked_secret_path(link))
 
 
 # ---------------------------------------------------------------------------

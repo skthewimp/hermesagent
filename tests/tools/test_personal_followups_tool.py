@@ -1,7 +1,12 @@
 import json
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from tools import personal_followups_tool as pft
+
+
+def _ist(monkeypatch):
+    monkeypatch.setattr(pft.hermes_time, "get_timezone", lambda: ZoneInfo("Asia/Kolkata"))
 
 
 def test_digest_creates_action_items_and_dedupes(tmp_path, monkeypatch):
@@ -51,11 +56,212 @@ def test_digest_creates_action_items_and_dedupes(tmp_path, monkeypatch):
     assert first["success"] is True
     assert first["counts"]["items_created_or_updated"] == 2
     assert "Asha" in first["summary"]
-    assert "Dev via email: Draft" in first["summary"]
+    assert "Dev" not in first["summary"]
     assert second["counts"]["items_created_or_updated"] == 2
 
     listed = json.loads(pft.personal_followups_tool({"action": "list", "status_filter": "all"}))
     assert len(listed["items"]) == 2
+
+
+def test_latest_outgoing_reply_closes_older_incoming_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
+    monkeypatch.setattr(pft, "_fetch_email_messages", lambda since, until, limit: [])
+    monkeypatch.setattr(
+        pft,
+        "_fetch_whatsapp_messages",
+        lambda since, until, limit: [
+            {
+                "source": "whatsapp",
+                "source_id": "wa-in",
+                "thread_key": "asha",
+                "contact": "Asha",
+                "contact_ref": "asha",
+                "direction": "incoming",
+                "message_at": "2026-05-17T10:00:00Z",
+                "subject": "",
+                "body": "Can you send me the notes?",
+                "metadata": {},
+            },
+            {
+                "source": "whatsapp",
+                "source_id": "wa-out",
+                "thread_key": "asha",
+                "contact": "Asha",
+                "contact_ref": "asha",
+                "direction": "outgoing",
+                "message_at": "2026-05-17T11:00:00Z",
+                "subject": "",
+                "body": "Sent them just now.",
+                "metadata": {},
+            },
+        ],
+    )
+
+    digest = json.loads(pft.personal_followups_tool({"action": "digest"}))
+    active = json.loads(pft.personal_followups_tool({"action": "list"}))
+
+    assert "No reply/follow-up todos" in digest["summary"]
+    assert active["items"] == []
+
+
+def test_latest_incoming_acknowledgement_closes_thread(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
+    monkeypatch.setattr(pft, "_fetch_email_messages", lambda since, until, limit: [])
+    monkeypatch.setattr(
+        pft,
+        "_fetch_whatsapp_messages",
+        lambda since, until, limit: [
+            {
+                "source": "whatsapp",
+                "source_id": "wa-out",
+                "thread_key": "asha",
+                "contact": "Asha",
+                "contact_ref": "asha",
+                "direction": "outgoing",
+                "message_at": "2026-05-17T10:00:00Z",
+                "subject": "",
+                "body": "Can you confirm you received the notes?",
+                "metadata": {},
+            },
+            {
+                "source": "whatsapp",
+                "source_id": "wa-in",
+                "thread_key": "asha",
+                "contact": "Asha",
+                "contact_ref": "asha",
+                "direction": "incoming",
+                "message_at": "2026-05-17T11:00:00Z",
+                "subject": "",
+                "body": "Thanks!",
+                "metadata": {},
+            },
+        ],
+    )
+
+    digest = json.loads(pft.personal_followups_tool({"action": "digest"}))
+
+    assert "No reply/follow-up todos" in digest["summary"]
+
+
+def test_candidate_uses_message_time_not_rescan_time(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
+    monkeypatch.setattr(pft, "_fetch_email_messages", lambda since, until, limit: [])
+    monkeypatch.setattr(
+        pft,
+        "_fetch_whatsapp_messages",
+        lambda since, until, limit: [
+            {
+                "source": "whatsapp",
+                "source_id": "wa-1",
+                "thread_key": "asha",
+                "contact": "Asha",
+                "contact_ref": "asha",
+                "direction": "incoming",
+                "message_at": "2026-05-12T03:00:00Z",
+                "subject": "",
+                "body": "Can you send me the notes?",
+                "metadata": {},
+            }
+        ],
+    )
+
+    pft.personal_followups_tool({"action": "digest"})
+    item = json.loads(pft.personal_followups_tool({"action": "list"}))["items"][0]
+
+    assert item["last_seen_at"] == "2026-05-12T03:00:00Z"
+
+
+def test_email_thread_key_matches_replies(tmp_path, monkeypatch):
+    assert pft._email_thread_key("Re: Project plan", "asha@example.com") == pft._email_thread_key(
+        "Project plan", "asha@example.com"
+    )
+
+
+def test_group_message_is_not_a_followup_candidate(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)
+    conn = pft._connect()
+    try:
+        message_id = pft._upsert_source_message(
+            conn,
+            {
+                "source": "whatsapp",
+                "source_id": "group-1",
+                "thread_key": "group-chat",
+                "contact": "Parents group",
+                "contact_ref": "group-chat",
+                "direction": "incoming",
+                "message_at": "2026-05-18T03:00:00Z",
+                "subject": "",
+                "body": "Can anyone volunteer on Friday?",
+                "metadata": {"is_group": True},
+            },
+            now,
+        )
+        row = conn.execute("SELECT * FROM source_messages WHERE id = ?", (message_id,)).fetchone()
+        assert pft._candidate_from_message(row) is None
+    finally:
+        conn.close()
+
+
+def test_transactional_email_is_not_a_followup_candidate(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)
+    conn = pft._connect()
+    try:
+        message_id = pft._upsert_source_message(
+            conn,
+            {
+                "source": "email",
+                "source_id": "email-transactional",
+                "thread_key": "thread-transactional",
+                "contact": "Vendor",
+                "contact_ref": "vendor@example.com",
+                "direction": "incoming",
+                "message_at": "2026-05-18T03:00:00Z",
+                "subject": "Purchase order confirmation",
+                "body": "Please review the attached details.",
+                "metadata": {},
+            },
+            now,
+        )
+        row = conn.execute("SELECT * FROM source_messages WHERE id = ?", (message_id,)).fetchone()
+        assert pft._candidate_from_message(row) is None
+    finally:
+        conn.close()
+
+
+def test_question_mark_inside_url_does_not_make_message_actionable(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)
+    conn = pft._connect()
+    try:
+        message_id = pft._upsert_source_message(
+            conn,
+            {
+                "source": "whatsapp",
+                "source_id": "link-1",
+                "thread_key": "asha",
+                "contact": "Asha",
+                "contact_ref": "asha",
+                "direction": "incoming",
+                "message_at": "2026-05-18T03:00:00Z",
+                "subject": "",
+                "body": "Here are the photos https://example.com/folder?share=1",
+                "metadata": {},
+            },
+            now,
+        )
+        row = conn.execute("SELECT * FROM source_messages WHERE id = ?", (message_id,)).fetchone()
+        assert pft._candidate_from_message(row) is None
+    finally:
+        conn.close()
 
 
 def test_feedback_dismisses_single_item_from_last_digest(tmp_path, monkeypatch):
@@ -157,6 +363,7 @@ def test_feedback_snoozes_item_with_explicit_id(tmp_path, monkeypatch):
 
 def test_outgoing_dated_commitment_is_snoozed_until_due_date(tmp_path, monkeypatch):
     monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    _ist(monkeypatch)
     fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)  # Monday
     monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
     monkeypatch.setattr(pft, "_fetch_whatsapp_messages", lambda since, until, limit: [])
@@ -186,12 +393,61 @@ def test_outgoing_dated_commitment_is_snoozed_until_due_date(tmp_path, monkeypat
     assert "No reply/follow-up todos" in digest["summary"]
     assert active["items"] == []
     assert len(snoozed["items"]) == 1
-    assert snoozed["items"][0]["suppress_until"] == "2026-05-22T00:00:00Z"
+    assert snoozed["items"][0]["suppress_until"] == "2026-05-22T05:00:00Z"
     assert snoozed["items"][0]["suggested_action"] == "Follow up on 2026-05-22."
+
+
+def test_log_action_records_next_week_as_monday_morning(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    _ist(monkeypatch)
+    fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)  # Monday
+    monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
+
+    result = json.loads(
+        pft.personal_followups_tool(
+            {
+                "action": "log",
+                "source": "telegram",
+                "contact": "Asha",
+                "raw_text": "i'll ping next week",
+            }
+        )
+    )
+    snoozed = json.loads(pft.personal_followups_tool({"action": "list", "status_filter": "snoozed"}))
+
+    assert result["success"] is True
+    assert result["status"] == "snoozed"
+    assert result["suppress_until"] == "2026-05-25T05:00:00Z"
+    assert snoozed["items"][0]["suggested_action"] == "Follow up on 2026-05-25."
+
+
+def test_log_action_records_next_month_as_first_business_day(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    _ist(monkeypatch)
+    fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)  # Monday
+    monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
+
+    result = json.loads(
+        pft.personal_followups_tool(
+            {
+                "action": "log",
+                "source": "telegram",
+                "contact": "Asha",
+                "raw_text": "i'll ping you next month",
+            }
+        )
+    )
+    snoozed = json.loads(pft.personal_followups_tool({"action": "list", "status_filter": "snoozed"}))
+
+    assert result["success"] is True
+    assert result["status"] == "snoozed"
+    assert result["suppress_until"] == "2026-06-01T05:00:00Z"
+    assert snoozed["items"][0]["suggested_action"] == "Follow up on 2026-06-01."
 
 
 def test_log_action_records_dated_followup_immediately(tmp_path, monkeypatch):
     monkeypatch.setenv("PERSONAL_FOLLOWUPS_DB", str(tmp_path / "followups.sqlite3"))
+    _ist(monkeypatch)
     fixed_now = datetime(2026, 5, 18, 3, 30, tzinfo=timezone.utc)  # Monday
     monkeypatch.setattr(pft, "_now_utc", lambda: fixed_now)
 
@@ -209,5 +465,5 @@ def test_log_action_records_dated_followup_immediately(tmp_path, monkeypatch):
 
     assert result["success"] is True
     assert result["status"] == "snoozed"
-    assert result["suppress_until"] == "2026-05-22T00:00:00Z"
+    assert result["suppress_until"] == "2026-05-22T05:00:00Z"
     assert snoozed["items"][0]["contact"] == "Asha"

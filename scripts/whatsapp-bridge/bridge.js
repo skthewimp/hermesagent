@@ -47,6 +47,8 @@ const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
 const CONTACT_CACHE_FILE = process.env.WHATSAPP_CONTACT_CACHE_FILE ||
   path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'contacts_cache.json');
+const OBSERVED_CACHE_FILE = process.env.WHATSAPP_OBSERVED_CACHE_FILE ||
+  path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'observed_messages.json');
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
@@ -57,6 +59,11 @@ const WHATSAPP_TOOL_ONLY =
   process.env &&
   typeof process.env.WHATSAPP_TOOL_ONLY === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_TOOL_ONLY.toLowerCase());
+const WHATSAPP_OUTBOUND_DISABLED =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_OUTBOUND_DISABLED === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_OUTBOUND_DISABLED.toLowerCase());
 const WHATSAPP_SYNC_CONTACTS =
   !process.env.WHATSAPP_SYNC_CONTACTS ||
   ['1', 'true', 'yes', 'on'].includes(String(process.env.WHATSAPP_SYNC_CONTACTS).toLowerCase());
@@ -91,6 +98,15 @@ function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
   });
   return Promise.race([sock.sendMessage(chatId, payload), timeoutPromise])
     .finally(() => clearTimeout(timer));
+}
+
+function suppressOutbound(res, kind) {
+  return res.json({
+    success: true,
+    suppressed: true,
+    reason: 'whatsapp_outbound_disabled',
+    kind,
+  });
 }
 
 function formatOutgoingMessage(message) {
@@ -283,6 +299,71 @@ function writeContactCache() {
   }
 }
 
+function loadObservedCache() {
+  if (!existsSync(OBSERVED_CACHE_FILE)) return 0;
+  try {
+    const parsed = JSON.parse(readFileSync(OBSERVED_CACHE_FILE, 'utf-8'));
+    const rows = Array.isArray(parsed) ? parsed : parsed?.messages;
+    if (!Array.isArray(rows)) return 0;
+    for (const row of rows.slice(-MAX_OBSERVED_MESSAGES)) {
+      if (row && typeof row === 'object') {
+        appendObservedMessage(row);
+      }
+    }
+    return observedMessages.length;
+  } catch (error) {
+    if (WHATSAPP_DEBUG) {
+      console.warn('WhatsApp observed cache load failed:', error?.message || error);
+    }
+    return 0;
+  }
+}
+
+function writeObservedCache() {
+  try {
+    mkdirSync(path.dirname(OBSERVED_CACHE_FILE), { recursive: true });
+    const payload = JSON.stringify({
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      messages: observedMessages.slice(-MAX_OBSERVED_MESSAGES),
+    });
+    const tmpPath = `${OBSERVED_CACHE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmpPath, payload, 'utf-8');
+    renameSync(tmpPath, OBSERVED_CACHE_FILE);
+  } catch (error) {
+    if (WHATSAPP_DEBUG) {
+      console.warn('WhatsApp observed cache save failed:', error?.message || error);
+    }
+  }
+}
+
+function scheduleObservedCacheSave() {
+  if (observedMessagesSaveTimer) clearTimeout(observedMessagesSaveTimer);
+  observedMessagesSaveTimer = setTimeout(() => {
+    observedMessagesSaveTimer = null;
+    writeObservedCache();
+  }, 1000);
+}
+
+function observedMessageKey(row) {
+  const messageId = String(row?.messageId || '');
+  if (!messageId) return '';
+  return `${String(row?.chatId || '')}:${messageId}`;
+}
+
+function appendObservedMessage(row) {
+  const key = observedMessageKey(row);
+  if (key && observedMessageKeys.has(key)) return false;
+  observedMessages.push(row);
+  if (key) observedMessageKeys.add(key);
+  while (observedMessages.length > MAX_OBSERVED_MESSAGES) {
+    const removed = observedMessages.shift();
+    const removedKey = observedMessageKey(removed);
+    if (removedKey) observedMessageKeys.delete(removedKey);
+  }
+  return true;
+}
+
 function resolveContact(query, limit = 10) {
   const needle = normalizeContactQuery(query);
   if (!needle) return [];
@@ -373,9 +454,11 @@ const APP_STATE_COLLECTIONS = [
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
 const observedMessages = [];
+const observedMessageKeys = new Set();
 const contactsById = new Map();
 let contactSyncPromise = null;
 let contactCacheSaveTimer = null;
+let observedMessagesSaveTimer = null;
 const contactSyncStatus = {
   enabled: WHATSAPP_SYNC_CONTACTS,
   runs: 0,
@@ -467,7 +550,7 @@ async function startSocket() {
     logger,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    syncFullHistory: true,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -484,12 +567,17 @@ async function startSocket() {
     rememberLidPhoneMapping(lid, pn);
   });
 
-  sock.ev.on('messaging-history.set', ({ contacts = [], lidPnMappings = [] }) => {
+  sock.ev.on('messaging-history.set', ({ contacts = [], lidPnMappings = [], messages = [] }) => {
     for (const contact of contacts) {
       rememberContact(contact);
     }
     for (const { lid, pn } of lidPnMappings) {
       rememberLidPhoneMapping(lid, pn);
+    }
+    if (messages.length) {
+      // Reuse the normal parser, but mark history as observation-only so old
+      // messages are cached without entering the live agent queue.
+      sock.ev.emit('messages.upsert', { messages, type: 'history' });
     }
   });
 
@@ -551,7 +639,9 @@ async function startSocket() {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
-    if (type !== 'notify' && type !== 'append') return;
+    if (type !== 'notify' && type !== 'append' && type !== 'history') return;
+    const observationOnly = type === 'history' || WHATSAPP_TOOL_ONLY;
+    const shouldDownloadMedia = type !== 'history';
 
     const botIds = Array.from(new Set([
       normalizeWhatsAppId(sock.user?.id),
@@ -582,7 +672,7 @@ async function startSocket() {
         continue;
       }
 
-      if (!WHATSAPP_TOOL_ONLY) {
+      if (!observationOnly) {
         // Handle fromMe messages based on mode
         if (msg.key.fromMe) {
           if (isGroup) continue;
@@ -656,7 +746,7 @@ async function startSocket() {
         body = messageContent.imageMessage.caption || '';
         hasMedia = true;
         mediaType = 'image';
-        try {
+        if (shouldDownloadMedia) try {
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
           const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
           const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
@@ -672,7 +762,7 @@ async function startSocket() {
         body = messageContent.videoMessage.caption || '';
         hasMedia = true;
         mediaType = 'video';
-        try {
+        if (shouldDownloadMedia) try {
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
           const mime = messageContent.videoMessage.mimetype || 'video/mp4';
           const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
@@ -686,7 +776,7 @@ async function startSocket() {
       } else if (messageContent.audioMessage || messageContent.pttMessage) {
         hasMedia = true;
         mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
-        try {
+        if (shouldDownloadMedia) try {
           const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
           const mime = audioMsg.mimetype || 'audio/ogg';
@@ -703,7 +793,7 @@ async function startSocket() {
         hasMedia = true;
         mediaType = 'document';
         const fileName = messageContent.documentMessage.fileName || 'document';
-        try {
+        if (shouldDownloadMedia) try {
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
           const safeFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -740,6 +830,8 @@ async function startSocket() {
         continue;
       }
 
+      // Capture every non-empty message for analysis first, even if we later
+      // decide not to route it into Hermes chat input.
       const event = {
         messageId: msg.key.id,
         chatId,
@@ -762,17 +854,15 @@ async function startSocket() {
 
       rememberMessageContact(event);
 
-      observedMessages.push({
+      const observedAdded = appendObservedMessage({
         observedAt: new Date().toISOString(),
         upsertType: type,
         direction: msg.key.fromMe ? 'outgoing' : 'incoming',
         ...event,
       });
-      while (observedMessages.length > MAX_OBSERVED_MESSAGES) {
-        observedMessages.shift();
-      }
+      if (observedAdded) scheduleObservedCacheSave();
 
-      if (WHATSAPP_TOOL_ONLY) {
+      if (observationOnly) {
         continue;
       }
 
@@ -825,7 +915,7 @@ app.get('/messages', (req, res) => {
   res.json(msgs);
 });
 
-// Non-destructive, in-memory view for tool-only WhatsApp analysis.
+// Non-destructive view of the bounded, persisted observation cache.
 app.get('/observed', (req, res) => {
   const limitRaw = parseInt(String(req.query.limit || '50'), 10);
   const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 200)) : 50;
@@ -895,6 +985,9 @@ app.post('/sync-contacts', async (req, res) => {
 
 // Send a message
 app.post('/send', async (req, res) => {
+  if (WHATSAPP_OUTBOUND_DISABLED) {
+    return suppressOutbound(res, 'send');
+  }
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -928,6 +1021,9 @@ app.post('/send', async (req, res) => {
 
 // Edit a previously sent message
 app.post('/edit', async (req, res) => {
+  if (WHATSAPP_OUTBOUND_DISABLED) {
+    return suppressOutbound(res, 'edit');
+  }
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -981,6 +1077,9 @@ function inferMediaType(ext) {
 
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
+  if (WHATSAPP_OUTBOUND_DISABLED) {
+    return suppressOutbound(res, 'send-media');
+  }
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -1058,6 +1157,9 @@ app.post('/send-media', async (req, res) => {
 
 // Typing indicator
 app.post('/typing', async (req, res) => {
+  if (WHATSAPP_OUTBOUND_DISABLED) {
+    return suppressOutbound(res, 'typing');
+  }
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected' });
   }
@@ -1109,6 +1211,7 @@ app.get('/health', (req, res) => {
 
 // Start
 const loadedContactCount = loadContactCache();
+const loadedObservedCount = loadObservedCache();
 if (PAIR_ONLY) {
   // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
   console.log('📱 WhatsApp pairing mode');
@@ -1133,6 +1236,9 @@ if (PAIR_ONLY) {
     }
     if (WHATSAPP_CONTACT_CACHE) {
       console.log(`👥 Loaded ${loadedContactCount} cached WhatsApp contacts.`);
+    }
+    if (loadedObservedCount > 0) {
+      console.log(`🗂️ Loaded ${loadedObservedCount} cached observed WhatsApp message(s).`);
     }
     console.log();
     startSocket();

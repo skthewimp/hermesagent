@@ -305,6 +305,16 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("WHATSAPP_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _outbound_disabled(self) -> bool:
+        configured = self.config.extra.get("outbound_disabled")
+        if configured is None:
+            configured = self.config.extra.get("disable_outbound")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("WHATSAPP_OUTBOUND_DISABLED", "false").lower() in {"true", "1", "yes", "on"}
+
     def _whatsapp_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
@@ -885,6 +895,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+        if self._outbound_disabled():
+            logger.info("[%s] WhatsApp outbound disabled; suppressed text send to %s", self.name, chat_id)
+            return SendResult(
+                success=True,
+                message_id=None,
+                raw_response={"suppressed": True, "reason": "whatsapp_outbound_disabled"},
+            )
 
         try:
             import aiohttp
@@ -940,6 +957,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
             return SendResult(success=False, error=bridge_exit)
+        if self._outbound_disabled():
+            logger.info("[%s] WhatsApp outbound disabled; suppressed edit to %s", self.name, chat_id)
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                raw_response={"suppressed": True, "reason": "whatsapp_outbound_disabled"},
+            )
         try:
             import aiohttp
             async with self._http_session.post(
@@ -973,6 +997,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
             return SendResult(success=False, error=bridge_exit)
+        if self._outbound_disabled():
+            logger.info("[%s] WhatsApp outbound disabled; suppressed media send to %s", self.name, chat_id)
+            return SendResult(
+                success=True,
+                message_id=None,
+                raw_response={"suppressed": True, "reason": "whatsapp_outbound_disabled"},
+            )
         try:
             import aiohttp
 
@@ -1075,6 +1106,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
+            return
+        if self._outbound_disabled():
             return
         
         try:
