@@ -1112,15 +1112,17 @@ them into invariants before re-requesting review.
 All Hermes-specific integration for the external
 `karthik-data-visualization-skill` repository belongs in this checkout:
 
-- `plugins/dataviz-release-guard/` owns turn detection, active-profile paths,
-  `delegate_task` guidance, `MEDIA:` release enforcement, and user-turn
-  budget grants.
 - `scripts/sync_karthik_dataviz.py` owns installation of the external skill
   surfaces into Hermes profiles.
 - `docs/karthik-dataviz.md` owns Karthik's host configuration, deployment,
   restart, and verification procedure.
+- Hermes provides the UI, skill loading, MCP transport, artifact delivery, and
+  optional delegation capabilities used by those skills.
 
-Do not add these client-specific concerns back to the external skills/MCP
-repository. Changes to this adapter require its focused plugin and sync tests;
-the full Hermes suite is not required unless the change also affects shared
-runtime, shared packaging, dependencies, or another cross-cutting surface.
+Workflow and release principles belong in the external skills/MCP repository.
+Do not duplicate them in a Hermes release gate or output-transform hook. Changes
+to this adapter require only the focused sync and directly affected adapter
+tests. This includes adding or removing adapter-specific package-data or
+manifest entries. Do not run the full Hermes suite for these changes: it tests
+the parent application rather than this visualization implementation. Run the
+full suite only when shared Hermes runtime behavior outside this adapter changes.

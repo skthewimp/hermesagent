@@ -1,20 +1,20 @@
 # Karthik data-visualization integration
 
-Hermes owns its client-specific adapter for the external
-`karthik-data-visualization-skill` repository. The external repository remains
-limited to portable skills, the repair case state machine, and the MCP server.
+Hermes provides the client runtime for the external
+`karthik-data-visualization-skill` repository. The external repository owns the
+workflow principles through its portable skills, repair case state machine, and
+MCP server.
 
 ## Components
 
-- `plugins/dataviz-release-guard/` detects chart-repair turns, injects the
-  active-profile skill and case paths, requires a fresh `delegate_task`
-  reviewer, and only permits a `MEDIA:` attachment whose hash has an
-  independent `Send` verdict.
 - `scripts/sync_karthik_dataviz.py` validates the external checkout and
   installs its Claude-compatible skill trees into the active profile's
   `skills/data-science` directory.
 - The MCP server continues to run from the external checkout's isolated
   environment and is registered under `mcp_servers.karthik_dataviz`.
+- Hermes supplies skill loading, MCP transport, visual inspection, optional
+  delegation, and native `MEDIA:` delivery. It does not impose a separate chart
+  release policy.
 
 ## Karthik's host deployment
 
@@ -29,7 +29,6 @@ git pull --ff-only
 cd /home/karthik/apps/hermes
 python scripts/sync_karthik_dataviz.py \
   --source /home/karthik/apps/karthik-data-visualization-skill
-hermes plugins enable dataviz-release-guard
 systemctl --user restart hermes-gateway.service
 ```
 
@@ -44,18 +43,17 @@ mcp_servers:
     connect_timeout: 30
 ```
 
-Verify the exact checked-out commits, the source validation, focused adapter
-tests, active gateway, and MCP child process:
+Verify the exact checked-out commits, source validation, focused sync tests,
+active gateway, and MCP child process:
 
 ```bash
 git -C /home/karthik/apps/karthik-data-visualization-skill rev-parse HEAD
 git -C /home/karthik/apps/hermes rev-parse HEAD
 scripts/run_tests.sh \
-  tests/plugins/test_dataviz_release_guard_plugin.py \
   tests/scripts/test_sync_karthik_dataviz.py
 systemctl --user is-active hermes-gateway.service
 ps -eo pid,args | rg '[d]ataviz_mcp'
 ```
 
-Start a new conversation after deployment so the process reloads the plugin and
-the installed skill text.
+Start a new conversation after deployment so the process loads the installed
+skill text.

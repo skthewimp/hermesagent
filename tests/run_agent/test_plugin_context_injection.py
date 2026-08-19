@@ -17,14 +17,14 @@ def test_injects_context_into_multimodal_content_without_mutating_history():
 
     injected = _inject_user_message_context(
         original,
-        ["Hermes release guard: use --session 'hermes-guard-123'"],
+        ["Plugin context: inspect the attached image at delivery size"],
     )
 
     assert injected == [
         *original,
         {
             "type": "text",
-            "text": "Hermes release guard: use --session 'hermes-guard-123'",
+            "text": "Plugin context: inspect the attached image at delivery size",
         },
     ]
     assert injected is not original
