@@ -1,0 +1,8 @@
+name: dataviz-release-guard
+version: 1.0.0
+description: Enforce reviewed chart delivery for repair turns.
+author: Karthik Shashidhar
+kind: standalone
+hooks:
+  - pre_llm_call
+  - transform_llm_output

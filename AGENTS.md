@@ -1050,7 +1050,11 @@ python -m pytest tests/ -q -n 4
 
 Worker count above 4 will surface test-ordering flakes that CI never sees.
 
-Always run the full suite before pushing changes.
+Run the smallest relevant test selection before pushing routine, localized
+changes. Run the full suite for broad runtime, dependency, shared packaging,
+test-infrastructure, or cross-cutting changes, and whenever the focused tests
+do not give adequate confidence. CI remains the final full-suite gate for
+localized changes.
 
 ### Don't write change-detector tests
 
@@ -1100,3 +1104,23 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+---
+
+## Karthik data-visualization adapter ownership
+
+All Hermes-specific integration for the external
+`karthik-data-visualization-skill` repository belongs in this checkout:
+
+- `plugins/dataviz-release-guard/` owns turn detection, active-profile paths,
+  `delegate_task` guidance, `MEDIA:` release enforcement, and user-turn
+  budget grants.
+- `scripts/sync_karthik_dataviz.py` owns installation of the external skill
+  surfaces into Hermes profiles.
+- `docs/karthik-dataviz.md` owns Karthik's host configuration, deployment,
+  restart, and verification procedure.
+
+Do not add these client-specific concerns back to the external skills/MCP
+repository. Changes to this adapter require its focused plugin and sync tests;
+the full Hermes suite is not required unless the change also affects shared
+runtime, shared packaging, dependencies, or another cross-cutting surface.
